@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>commandcode-pool</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; max-width: 640px;
+         margin: 48px auto; padding: 0 20px; color: #1f2933; line-height: 1.6; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #6b7280; margin-bottom: 28px; }
+  h2 { font-size: 15px; margin: 22px 0 8px; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  td { padding: 5px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  td:first-child { white-space: nowrap; font-family: monospace; }
+  a { color: #2563eb; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 20px 24px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>commandcode-pool</h1>
+  <div class="sub">多 Command Code 账号号池 · OpenAI / Anthropic / Responses 兼容 API</div>
+
+  <h2>端点</h2>
+  <table>
+    <tr><td>POST /v1/chat/completions</td><td>OpenAI Chat Completions（流式 + 非流式）</td></tr>
+    <tr><td>POST /v1/messages</td><td>Anthropic Messages API</td></tr>
+    <tr><td>POST /v1/responses</td><td>OpenAI Responses API</td></tr>
+    <tr><td>GET /v1/models</td><td>模型目录</td></tr>
+    <tr><td>GET /health</td><td>健康检查</td></tr>
+  </table>
+
+  <h2>管理</h2>
+  <p><a href="/admin">/admin</a> — 号池管理面板（账号、额度、用量、冷却状态）</p>
+
+  <h2>说明</h2>
+  <p style="font-size:13.5px">客户端鉴权：<code>Authorization: Bearer &lt;API_KEYS&gt;</code>（或 <code>x-api-key</code> 头）。<br>
+  管理 API：<code>/api/*</code> + <code>x-admin-token</code> 头。详见部署文档。</p>
+</div>
+</body>
+</html>

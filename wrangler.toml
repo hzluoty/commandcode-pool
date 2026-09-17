@@ -1,0 +1,59 @@
+# commandcode-pool — Cloudflare Worker（多账号号池 → OpenAI / Anthropic / Responses 兼容 API）
+#
+# 首次部署最省事：./deploy.sh（自动确保 D1 database_id、部署 Worker + 静态页面）
+# 手动部署见 README.md「部署」。
+# 必须配置：npx wrangler secret put ADMIN_TOKEN   给管理 API 加访问令牌
+#           npx wrangler secret put API_KEYS      给 /v1/* 加客户端 Bearer 鉴权
+# 仅本地开发可显式设置 ALLOW_ANONYMOUS=true 放开未配置的鉴权
+
+name = "commandcode-pool"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+# 静态页面：public/ 目录由 wrangler 直接托管（/ → index.html，/admin → admin.html）。
+# 未命中静态资源的请求（/v1/*、/api/*、/health）落到 worker.js。
+[assets]
+directory = "./public"
+
+[vars]
+# 上游地址（开发时可用 .dev.vars 覆盖指向本地 mock_server.py）
+API_BASE = "https://api.commandcode.ai"
+
+# 账号调度策略：
+#   sticky      默认。粘住单账号直至额度耗尽（429/401），缓存最友好
+#   round_robin 最久未用优先，均摊负载（牺牲 prompt cache 命中）
+POOL_STRATEGY = "sticky"
+
+# 设备指纹盐：非空时成批更换所有账号的伪造设备身份（逃生口；留空保持稳定身份）
+FINGERPRINT_SALT = ""
+
+# 上游读空闲超时（毫秒）：流式 / 非流式。超时按 429 rate_limit_error 返回并可触发换号
+STREAM_IDLE_MS = "30000"
+NONSTREAM_IDLE_MS = "90000"
+
+# 客户端未提供 system 时，是否发送占位 system（' '）阻止上游注入默认 system prompt（省额度）
+EMPTY_SYSTEM_PLACEHOLDER = "true"
+
+# 时区偏移（小时，用于 /api/usage/daily 的分桶标签；默认 UTC+8）
+# TIMEZONE_OFFSET = "8"
+
+# 以下两项建议用 `wrangler secret put` 设置，不要明文写在 toml 里：
+# API_KEYS   = ""   # 逗号分隔的客户端 Bearer Key
+# ADMIN_TOKEN = ""  # /api/* 管理令牌（x-admin-token 头）
+# ALLOW_ANONYMOUS = "false" # 仅本地开发显式放开匿名访问
+# ACCOUNTS   = ""   # 未绑定 D1 时的内存号池：JSON 数组 [{"key":"...","label":"..."}]
+#                   # 或逗号分隔的 Command Code API Key 列表
+
+# D1：账号、额度缓存、用量与冷却状态持久化（跨 isolate 一致，推荐）。
+# database_id 为空时由 deploy.sh 自动创建回填；手动部署：
+#   npx wrangler d1 create commandcode-pool   # 把输出的 database_id 粘到下面
+[[d1_databases]]
+binding = "DB"
+database_name = "commandcode-pool"
+database_id = ""
+
+# 可选：workers.dev 在部分地区被 DNS 污染时，取消注释并改成你的域名
+#（域名需已接入 Cloudflare）：
+# routes = [
+#   { pattern = "pool.example.com/*", zone_name = "example.com" }
+# ]

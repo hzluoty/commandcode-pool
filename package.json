@@ -1,0 +1,17 @@
+{
+  "name": "commandcode-pool",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker: pool multiple Command Code accounts behind OpenAI / Anthropic / Responses compatible APIs, cache-aware sticky scheduling",
+  "main": "worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "mock": "python3 mock_server.py",
+    "test": "node test/test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

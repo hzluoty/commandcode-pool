@@ -1,0 +1,26 @@
+# 本地开发配置（cp .dev.vars.example .dev.vars；.dev.vars 会被 git 忽略）
+# 上游地址：指向本地 mock_server.py（python3 mock_server.py 18090）
+API_BASE=http://127.0.0.1:18090
+
+# 客户端 Bearer Key（逗号分隔）
+API_KEYS=sk-local-test-key
+
+# 管理 API 令牌（x-admin-token 头）
+ADMIN_TOKEN=admin-local-token
+
+# 仅本地开发可设为 true；未配置 API_KEYS/ADMIN_TOKEN 时允许匿名访问
+ALLOW_ANONYMOUS=false
+
+# 账号调度：sticky（默认，缓存友好）| round_robin
+POOL_STRATEGY=sticky
+
+# 未绑定 D1 时的内存号池（JSON 数组或逗号分隔 Key 列表）
+# mock_server.py 按 key 里的形态名选择应答：
+#   sk-ok-* 正常 | sk-zero-* 零输出 | sk-partial-* 流中断(无 finish)
+#   sk-tool-* 工具调用 | sk-streamerr-* 流内错误(<429>) | sk-slow-* 慢速(触发空闲超时)
+#   sk-snake-* snake_case usage | sk-exhausted-* 402 | sk-limited-* 429
+#   sk-badkey-* 401 | sk-forbidden-* 403 | sk-badrequest-* 400
+ACCOUNTS=[{"key":"cc-ok-1","label":"ok1"},{"key":"cc-ok-2","label":"ok2"}]
+
+# 本地开发用的指纹盐（换成任意字符串即批量更换伪造设备身份）
+FINGERPRINT_SALT=dev-salt
