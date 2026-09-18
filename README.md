@@ -197,6 +197,11 @@ snake_case \| `cc-exhausted-*` 402 \| `cc-limited-*` 429 \| `cc-badkey-*` 401 \|
 - [commandcode-usage](https://github.com/MAXeaglet/commandcode-usage)（MAXeaglet，MIT）— 号池调度思路、多账号额度面板与离线 mock 形态参考。
 - [pi-commandcode-provider](https://github.com/patlux/pi-commandcode-provider)（patlux，MIT）— 浏览器授权（OAuth localhost 回调）流程参考。
 
+## 社区
+
+本项目在 [LINUX DO](https://linux.do) 社区发布与交流 — *Where possibility begins.*
+欢迎佬友们到社区参与讨论、反馈问题与提出建议。
+
 ## 许可证
 
 本项目基于 [MIT License](LICENSE) 发布。上述被参考项目各自的 MIT 许可证与版权声明归其原作者所有。
