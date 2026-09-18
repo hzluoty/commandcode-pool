@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Cloudflare Worker: pool multiple Command Code accounts behind OpenAI / Anthropic / Responses compatible APIs, cache-aware sticky scheduling",
   "main": "worker.js",
+  "license": "MIT",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
