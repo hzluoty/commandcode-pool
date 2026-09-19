@@ -3867,10 +3867,20 @@ async function fetchModels(base, apiKey, signal, timeoutMs = DEFAULT_CONTROL_PLA
     timeoutMs,
     consume: async (response, bodySignal) => {
       const text = await readLimitedText(response, MAX_UPSTREAM_JSON_BYTES, bodySignal);
-      if (!response.ok) throw new Error('models: HTTP ' + response.status);
+      if (!response.ok) {
+        const error = new Error('models: HTTP ' + response.status);
+        error.status = response.status;
+        error.body = text.slice(0, 300);
+        throw error;
+      }
       let list;
       try { list = JSON.parse(text); }
-      catch { throw new Error('models: invalid JSON response'); }
+      catch {
+        const error = new Error('models: invalid JSON response');
+        error.status = 502;
+        error.body = text.slice(0, 200);
+        throw error;
+      }
       const data = Array.isArray(list?.data) ? list.data : [];
       return data.map((m) => ({
         id: m.id,
