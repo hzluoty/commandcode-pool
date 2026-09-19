@@ -43,6 +43,16 @@ const MAX_SSE_EVENT_CHARS = 2 * 1024 * 1024;
 // 上游读空闲超时（只计 reader.read() 的等待，每收到 chunk 重置，不是总时长）。
 const DEFAULT_STREAM_IDLE_MS = 30000;
 const DEFAULT_NONSTREAM_IDLE_MS = 90000;
+const DEFAULT_CONTROL_PLANE_TIMEOUT_MS = 10000;
+const FINGERPRINT_CACHE_TTL_MS = 30 * 60 * 1000;
+const KEY_STATE_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_FINGERPRINT_CACHE_ENTRIES = 256;
+const MAX_KEY_STATE_ENTRIES = 256;
+const MAX_MODEL_CACHE_ENTRIES = 128;
+const MAX_USAGE_RETENTION_SECONDS = 90 * 24 * 60 * 60;
+const D1_MIGRATION_LOCK_MS = 5 * 60 * 1000;
+const D1_MIGRATION_WAIT_MS = 250;
+const D1_MIGRATION_BATCH_ROWS = 100;
 
 // 按天用量统计的时区偏移（小时）。默认 UTC+8，可用环境变量 TIMEZONE_OFFSET 覆盖。
 const DEFAULT_TZ_OFFSET = 8;
@@ -188,6 +198,7 @@ function getConfig(env = {}) {
     fingerprintSalt: env.FINGERPRINT_SALT || '',
     streamIdleMs: positiveInt(env.STREAM_IDLE_MS, DEFAULT_STREAM_IDLE_MS),
     nonStreamIdleMs: positiveInt(env.NONSTREAM_IDLE_MS, DEFAULT_NONSTREAM_IDLE_MS),
+    controlPlaneTimeoutMs: positiveInt(env.CONTROL_PLANE_TIMEOUT_MS, DEFAULT_CONTROL_PLANE_TIMEOUT_MS),
     emptySystemPlaceholder: String(env.EMPTY_SYSTEM_PLACEHOLDER ?? 'true').toLowerCase() !== 'false',
     cliMode: env.CLI_MODE || 'agent',
     cliSessionMode: env.CLI_SESSION_MODE || 'interactive',
@@ -288,18 +299,78 @@ async function fingerprintHash(value) {
   return bytesToHex(await sha256Text(`${FP_SALT}\0${v.toLowerCase()}`));
 }
 
-// 指纹按 key（+salt）缓存 Promise，避免并发首请求重复计算、多 isolate 各自缓存一份。
-const fingerprintPromises = new Map();
-function getFingerprint(apiKey, salt) {
-  const cacheKey = `${salt}:${apiKey}`;
-  let p = fingerprintPromises.get(cacheKey);
-  if (!p) {
-    p = generateFingerprint(apiKey, salt);
-    fingerprintPromises.set(cacheKey, p);
+// Isolate 内共享缓存：持久值只使用不可逆 scope key，统一 TTL 和容量；
+// 正在计算的 Promise 只在短暂 single-flight 期间按嵌套 scope 保存。
+class IsolateCache {
+  constructor(maxEntries, defaultTtlMs) {
+    this.maxEntries = maxEntries;
+    this.defaultTtlMs = defaultTtlMs;
+    this.items = new Map();
   }
-  return p;
+  get(key, now = Date.now()) {
+    const entry = this.items.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= now) {
+      this.items.delete(key);
+      return undefined;
+    }
+    this.items.delete(key);
+    this.items.set(key, entry);
+    return entry.value;
+  }
+  set(key, value, ttlMs = this.defaultTtlMs) {
+    this.items.delete(key);
+    this.items.set(key, { value, expiresAt: Date.now() + ttlMs });
+    while (this.items.size > this.maxEntries) {
+      this.items.delete(this.items.keys().next().value);
+    }
+  }
+  delete(key) { this.items.delete(key); }
+  get size() { return this.items.size; }
+}
+function structuredScopeKey(...parts) {
+  return parts.map((part) => {
+    const value = String(part ?? '');
+    return `${value.length}:${value}`;
+  }).join('|');
+}
+async function digestCacheKey(scope, value) {
+  return bytesToHex(await sha256Text(`command-code-cache-v1\0${scope}\0${value}`));
 }
 
+const fingerprintCache = new IsolateCache(MAX_FINGERPRINT_CACHE_ENTRIES, FINGERPRINT_CACHE_TTL_MS);
+const fingerprintFlights = new Map(); // 仅短暂保存原始 credential，避免长期明文 key
+function getNestedFlight(map, scope, credential) {
+  let scoped = map.get(scope);
+  if (!scoped) { scoped = new Map(); map.set(scope, scoped); }
+  let promise = scoped.get(credential);
+  return { scoped, promise };
+}
+function clearNestedFlight(map, scope, credential, promise) {
+  const scoped = map.get(scope);
+  if (!scoped || scoped.get(credential) !== promise) return;
+  scoped.delete(credential);
+  if (!scoped.size) map.delete(scope);
+}
+function getFingerprint(apiKey, salt) {
+  const scope = structuredScopeKey(salt);
+  const active = getNestedFlight(fingerprintFlights, scope, apiKey);
+  if (active.promise) return active.promise;
+  const promise = (async () => {
+    const cacheKey = await digestCacheKey('fingerprint', structuredScopeKey(salt, apiKey));
+    const cached = fingerprintCache.get(cacheKey);
+    if (cached) return cached;
+    const value = await generateFingerprint(apiKey, salt);
+    fingerprintCache.set(cacheKey, value);
+    return value;
+  })();
+  active.scoped.set(apiKey, promise);
+  promise.then(
+    () => clearNestedFlight(fingerprintFlights, scope, apiKey, promise),
+    () => clearNestedFlight(fingerprintFlights, scope, apiKey, promise),
+  );
+  return promise;
+}
 async function generateFingerprint(apiKey, salt) {
   const cpuEntry = FINGERPRINT_CPUS[await fpPickIndex(apiKey, 'cpu', FINGERPRINT_CPUS, (i) => `${FINGERPRINT_CPUS[i].model}|${FINGERPRINT_CPUS[i].cores}`, salt)];
   const memGiB = FINGERPRINT_MEMS[await fpPickIndex(apiKey, 'mem', FINGERPRINT_MEMS, (i) => String(FINGERPRINT_MEMS[i]), salt)];
@@ -411,7 +482,9 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;
 const INIT_JITTER_MS = 2 * 60 * 60 * 1000;
 
-const keyStateStore = new Map(); // `${salt}:${apiKey}` → { nextInitAt }
+const keyStateCache = new IsolateCache(MAX_KEY_STATE_ENTRIES, KEY_STATE_TTL_MS);
+const keyStateFlights = new Map(); // 仅 pending 阶段短暂按 raw credential single-flight
+const keyStateScope = (cfg) => structuredScopeKey(cfg.apiBase, cfg.fingerprintSalt, cfg.cliSessionMode);
 
 function cliHeaders(cfg) {
   return {
@@ -422,52 +495,97 @@ function cliHeaders(cfg) {
   };
 }
 
-async function ensureInitialized(apiKey, env, signal) {
+async function sendInitializationEvent(url, headers, body, cfg, signal, label) {
+  await upstreamFetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  }, {
+    signal,
+    timeoutMs: cfg.controlPlaneTimeoutMs,
+    consume: async (response, bodySignal) => {
+      await readLimitedText(response, MAX_UPSTREAM_JSON_BYTES, bodySignal);
+      if (!response.ok) {
+        const error = new Error(`${label} HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
+    },
+  });
+}
+function waitForSharedFlight(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortErrorFrom(signal));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onAbort = () => finish(reject, abortErrorFrom(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
+  });
+}
+
+function ensureInitialized(apiKey, env, signal) {
   const cfg = getConfig(env);
-  const storeKey = `${cfg.fingerprintSalt}:${apiKey}`;
-  let state = keyStateStore.get(storeKey);
-  if (!state) { state = { nextInitAt: 0 }; keyStateStore.set(storeKey, state); }
-  const now = Date.now();
-  if (now < state.nextInitAt) return;
-
-  try {
-    const fingerprint = await getFingerprint(apiKey, cfg.fingerprintSalt);
-    const headers = { ...cliHeaders(cfg), 'Authorization': `Bearer ${apiKey}` };
-    await Promise.all([
-      fetch(`${cfg.apiBase}/alpha/fingerprint/record`, {
-        method: 'POST', headers, signal,
-        body: JSON.stringify(fingerprint),
-      }).then((r) => {
-        if (!r.ok) console.warn(JSON.stringify({ message: 'fingerprint record failed', status: r.status }));
-      }).catch((e) => {
-        if (e.name !== 'AbortError') console.warn(JSON.stringify({ message: 'fingerprint record error', error: e.message }));
-      }),
-      fetch(`${cfg.apiBase}/alpha/lifecycle-events`, {
-        method: 'POST', headers, signal,
-        body: JSON.stringify({
-          eventType: 'cli_session_exists',
-          metadata: {
-            sessionId: `sess_${randomHex(8)}`,
-            cliVersion: CC_PROTOCOL_VERSION,
-            mode: cfg.cliSessionMode,
-            os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
-          },
-        }),
-      }).then((r) => {
-        if (!r.ok) console.warn(JSON.stringify({ message: 'lifecycle event failed', status: r.status }));
-      }).catch((e) => {
-        if (e.name !== 'AbortError') console.warn(JSON.stringify({ message: 'lifecycle event error', error: e.message }));
-      }),
-    ]);
-
-    // 8h + 2h 抖动（按 key 派生，避免多 isolate 同时刷新）
-    const j = (await fpDigest(apiKey, 'init-jitter', cfg.fingerprintSalt)).slice(0, 4);
-    const jitter = ((j[0] << 24 | j[1] << 16 | j[2] << 8 | j[3]) >>> 0) % INIT_JITTER_MS;
-    state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
-  } catch (e) {
-    // 初始化失败永不阻塞业务请求，下次请求重试
-    if (e.name !== 'AbortError') console.warn(JSON.stringify({ message: 'fingerprint/lifecycle refresh error, will retry next request', error: e.message }));
-  }
+  const scope = keyStateScope(cfg);
+  const active = getNestedFlight(keyStateFlights, scope, apiKey);
+  if (active.promise) return waitForSharedFlight(active.promise, signal);
+  let promise;
+  promise = (async () => {
+    const sharedSignal = new AbortController();
+    const sharedTimer = setTimeout(() => sharedSignal.abort(controlPlaneTimeoutError(`${cfg.apiBase}/init`)), cfg.controlPlaneTimeoutMs);
+    try {
+      const cacheKey = await digestCacheKey('init-state', structuredScopeKey(cfg.apiBase, cfg.fingerprintSalt, cfg.cliSessionMode, apiKey));
+      let state = keyStateCache.get(cacheKey);
+      if (!state) {
+        state = { nextInitAt: 0, inFlight: null };
+        keyStateCache.set(cacheKey, state);
+      }
+      if (state.inFlight && state.inFlight !== promise) return state.inFlight;
+      if (Date.now() < state.nextInitAt) return;
+      const work = (async () => {
+        const fingerprint = await getFingerprint(apiKey, cfg.fingerprintSalt);
+        const headers = { ...cliHeaders(cfg), 'Authorization': `Bearer ${apiKey}` };
+        await Promise.all([
+          sendInitializationEvent(`${cfg.apiBase}/alpha/fingerprint/record`, headers, fingerprint, cfg, sharedSignal.signal, 'fingerprint record'),
+          sendInitializationEvent(`${cfg.apiBase}/alpha/lifecycle-events`, headers, {
+            eventType: 'cli_session_exists',
+            metadata: {
+              sessionId: `sess_${randomHex(8)}`,
+              cliVersion: CC_PROTOCOL_VERSION,
+              mode: cfg.cliSessionMode,
+              os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
+            },
+          }, cfg, sharedSignal.signal, 'lifecycle event'),
+        ]);
+        const j = (await fpDigest(apiKey, 'init-jitter', cfg.fingerprintSalt)).slice(0, 4);
+        const jitter = ((j[0] << 24 | j[1] << 16 | j[2] << 8 | j[3]) >>> 0) % INIT_JITTER_MS;
+        state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
+      })();
+      state.inFlight = work;
+      try {
+        await work;
+      } finally {
+        if (state.inFlight === work) state.inFlight = null;
+      }
+    } finally {
+      clearTimeout(sharedTimer);
+      if (!sharedSignal.signal.aborted) sharedSignal.abort();
+    }
+  })();
+  active.scoped.set(apiKey, promise);
+  promise.then(
+    () => clearNestedFlight(keyStateFlights, scope, apiKey, promise),
+    () => clearNestedFlight(keyStateFlights, scope, apiKey, promise),
+  );
+  return waitForSharedFlight(promise, signal);
 }
 
 // ============================ §D 小工具 ============================
@@ -572,26 +690,59 @@ async function readBody(request) {
   try { return JSON.parse(new TextDecoder().decode(bytes)); } catch (e) { return null; }
 }
 
-async function readLimitedText(response, maxBytes = MAX_UPSTREAM_JSON_BYTES) {
+async function abortableRead(reader, signal) {
+  if (!signal) return reader.read();
+  if (signal.aborted) throw abortErrorFrom(signal);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      try { reader.cancel(); } catch { /* body already closed */ }
+      reject(abortErrorFrom(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    reader.read().then((value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      resolve(value);
+    }, (error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      reject(error);
+    });
+  });
+}
+
+function abortErrorFrom(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error('The operation was aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+async function readLimitedText(response, maxBytes = MAX_UPSTREAM_JSON_BYTES, signal) {
   if (!response.body) return '';
   const reader = response.body.getReader();
   const chunks = [];
   let total = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await abortableRead(reader, signal);
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
-        try { await reader.cancel(); } catch (e) { /* upstream body already closed */ }
-        const err = new Error('upstream response is too large');
-        err.status = 502;
-        throw err;
+        try { await reader.cancel(); } catch { /* upstream body already closed */ }
+        const error = new Error('upstream response is too large');
+        error.status = 502;
+        throw error;
       }
       chunks.push(value);
     }
   } finally {
-    try { reader.releaseLock(); } catch (e) { /* already released */ }
+    try { reader.releaseLock(); } catch { /* already released */ }
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -600,6 +751,42 @@ async function readLimitedText(response, maxBytes = MAX_UPSTREAM_JSON_BYTES) {
     offset += chunk.byteLength;
   }
   return new TextDecoder().decode(bytes);
+}
+
+function controlPlaneTimeoutError(url) {
+  const error = new Error(`upstream request timed out: ${url}`);
+  error.name = 'TimeoutError';
+  error.status = 504;
+  return error;
+}
+
+// 控制面唯一的 fetch owner：deadline 同时覆盖 fetch 与响应体读取，并在 finally 释放 signal/timer。
+async function upstreamFetch(url, options = {}, { signal, timeoutMs = DEFAULT_CONTROL_PLANE_TIMEOUT_MS, consume } = {}) {
+  if (typeof consume !== 'function') throw new TypeError('upstreamFetch requires a consume callback');
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutError = controlPlaneTimeoutError(url);
+  const onAbort = () => controller.abort(abortErrorFrom(signal));
+  if (signal) {
+    if (signal.aborted) throw abortErrorFrom(signal);
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(timeoutError);
+  }, timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return consume ? await consume(response, controller.signal) : response;
+  } catch (error) {
+    if (signal?.aborted) throw abortErrorFrom(signal);
+    if (timedOut || controller.signal.aborted && controller.signal.reason === timeoutError) throw timeoutError;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+    if (!controller.signal.aborted) controller.abort();
+  }
 }
 
 // ============================ 错误模型 ============================
@@ -2155,8 +2342,9 @@ function buildResponsesObject(responseId, model, created, fullText, thinkingText
 
 // ============================ §K 额度查询（/alpha/*） ============================
 
-async function getJson(base, path, key) {
-  const resp = await fetch(base + path, {
+async function getJson(base, path, key, signal, timeoutMs = DEFAULT_CONTROL_PLANE_TIMEOUT_MS) {
+  const url = base + path;
+  return upstreamFetch(url, {
     headers: {
       'Authorization': 'Bearer ' + key,
       'Accept': 'application/json',
@@ -2164,16 +2352,26 @@ async function getJson(base, path, key) {
       'x-command-code-version': CC_PROTOCOL_VERSION,
       'x-cli-environment': 'production',
     },
+  }, {
+    signal,
+    timeoutMs,
+    consume: async (response, bodySignal) => {
+      const text = await readLimitedText(response, MAX_UPSTREAM_JSON_BYTES, bodySignal);
+      if (!response.ok) {
+        const error = new Error('HTTP ' + response.status);
+        error.status = response.status;
+        error.body = text.slice(0, 300);
+        throw error;
+      }
+      try { return JSON.parse(text); }
+      catch {
+        const error = new Error('non-JSON response');
+        error.status = 502;
+        error.body = text.slice(0, 200);
+        throw error;
+      }
+    },
   });
-  const text = await readLimitedText(resp);
-  if (!resp.ok) {
-    const err = new Error('HTTP ' + resp.status);
-    err.status = resp.status;
-    err.body = text.slice(0, 300);
-    throw err;
-  }
-  try { return JSON.parse(text); }
-  catch (e) { const err = new Error('non-JSON response'); err.status = 502; err.body = text.slice(0, 200); throw err; }
 }
 
 function pickWindow(wl, names) {
@@ -2195,14 +2393,14 @@ function normalizeWindow(raw) {
   };
 }
 
-async function fetchReport(base, key) {
+async function fetchReport(base, key, signal, timeoutMs = DEFAULT_CONTROL_PLANE_TIMEOUT_MS) {
   const failures = [];
   const report = { sections: {} };
   let orgId;
   let planIdFallback;
 
   try {
-    const who = await getJson(base, '/alpha/whoami', key);
+    const who = await getJson(base, '/alpha/whoami', key, signal, timeoutMs);
     const user = isRecord(who.user) ? who.user : (isRecord(who.data) && isRecord(who.data.user) ? who.data.user : undefined);
     if (user) {
       report.account = {
@@ -2216,6 +2414,7 @@ async function fetchReport(base, key) {
     orgId = org ? str(org.id) : undefined;
   } catch (e) {
     if (e.status === 401 || e.status === 403) {
+    if (signal?.aborted || e?.name === 'AbortError' || e?.name === 'TimeoutError') throw e;
       const err = new Error('密钥被拒（HTTP ' + e.status + '）——请确认密钥有效，从 commandcode.ai/settings 获取。');
       err.status = e.status;
       throw err;
@@ -2224,7 +2423,7 @@ async function fetchReport(base, key) {
   }
 
   try {
-    const cr = await getJson(base, '/alpha/billing/credits', key);
+    const cr = await getJson(base, '/alpha/billing/credits', key, signal, timeoutMs);
     const credits = isRecord(cr.credits) ? cr.credits :
       (isRecord(cr.data) && isRecord(cr.data.credits) ? cr.data.credits : undefined);
     const wl = isRecord(cr.windowLimits) ? cr.windowLimits :
@@ -2244,12 +2443,15 @@ async function fetchReport(base, key) {
       report.sections.credits = true;
       if (credits) planIdFallback = str(credits.planId) ?? str(credits.plan_id);
     }
-  } catch (e) { failures.push('billing/credits: ' + e.message); }
+  } catch (e) {
+    if (signal?.aborted || e?.name === 'AbortError' || e?.name === 'TimeoutError') throw e;
+    failures.push('billing/credits: ' + e.message);
+  }
 
   try {
     const sub = await getJson(base, orgId
       ? '/alpha/billing/subscriptions?orgId=' + encodeURIComponent(orgId)
-      : '/alpha/billing/subscriptions', key);
+      : '/alpha/billing/subscriptions', key, signal, timeoutMs);
     const data = isRecord(sub.data) ? sub.data : (isRecord(sub.subscription) ? sub.subscription : undefined);
     const planId = str(data?.planId) ?? str(data?.plan_id) ?? planIdFallback;
     if (data || planId) {
@@ -2278,11 +2480,12 @@ async function fetchReport(base, key) {
       report.planSource = 'credits';
       report.sections.plan = true;
     }
+    if (signal?.aborted || e?.name === 'AbortError' || e?.name === 'TimeoutError') throw e;
     failures.push('billing/subscriptions: ' + e.message);
   }
 
   try {
-    const us = await getJson(base, '/alpha/usage/summary', key);
+    const us = await getJson(base, '/alpha/usage/summary', key, signal, timeoutMs);
     const u = isRecord(us.data) ? us.data : us;
     if (isRecord(u)) {
       report.usage = {
@@ -2299,7 +2502,10 @@ async function fetchReport(base, key) {
       };
       report.sections.usage = true;
     }
-  } catch (e) { failures.push('usage/summary: ' + e.message); }
+  } catch (e) {
+    if (signal?.aborted || e?.name === 'AbortError' || e?.name === 'TimeoutError') throw e;
+    failures.push('usage/summary: ' + e.message);
+  }
 
   if (failures.length) report.failures = failures;
   if (!report.account && !report.credits && !report.plan) {
@@ -2438,9 +2644,31 @@ function rowToAccount(row) {
 
 // D1 账号池：状态（冷却、用量、粘性选择）全部落库，跨 isolate 一致。
 class D1Pool {
-  constructor(db) { this.db = db; this._schemaReady = false; this.tzOffset = DEFAULT_TZ_OFFSET; }
+  constructor(db) { this.db = db; this._schemaReady = false; this._schemaPromise = null; this._seedPromise = null; this.tzOffset = DEFAULT_TZ_OFFSET; }
 
   async ensureSchema() {
+    if (this._schemaReady) return;
+    if (this._schemaPromise) return this._schemaPromise;
+    this._schemaPromise = (async () => {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const ready = await this._ensureSchema();
+        if (ready !== false) return;
+        await new Promise((resolve) => setTimeout(resolve, D1_MIGRATION_WAIT_MS));
+      }
+      const error = new Error('D1 usage migration is still in progress');
+      error.code = 'D1_MIGRATION_IN_PROGRESS';
+      error.status = 503;
+      throw error;
+    })();
+    try {
+      await this._schemaPromise;
+      this._schemaReady = true;
+    } finally {
+      this._schemaPromise = null;
+    }
+  }
+
+  async _ensureSchema() {
     if (this._schemaReady) return;
     await this.db.batch([
       this.db.prepare(`CREATE TABLE IF NOT EXISTS accounts (
@@ -2481,6 +2709,12 @@ class D1Pool {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL DEFAULT ''
       )`),
+      this.db.prepare(`CREATE TABLE IF NOT EXISTS usage_migration_rows (
+        migration_key TEXT NOT NULL,
+        day TEXT NOT NULL,
+        account_id INTEGER NOT NULL,
+        PRIMARY KEY (migration_key, day, account_id)
+      )`)
     ]);
 
     // CREATE TABLE IF NOT EXISTS does not upgrade an existing D1 table. Add
@@ -2552,26 +2786,51 @@ class D1Pool {
       await this.db.prepare('CREATE INDEX IF NOT EXISTS idx_usage_daily_day ON usage_daily(day)').run();
 
       const migrated = await this.db.prepare("SELECT value FROM usage_meta WHERE key = 'daily_to_bucket_v1'").first();
-      if (!migrated) {
-        const { results: legacyRows } = await this.db.prepare(
-          'SELECT day, account_id, requests, prompt_tokens, completion_tokens, cache_read_tokens FROM usage_daily'
-        ).all();
-        for (const row of legacyRows || []) {
-          await this.db.prepare(
-            `INSERT INTO usage_buckets (bucket_start, account_id, requests, prompt_tokens, completion_tokens, cache_read_tokens)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(bucket_start, account_id) DO UPDATE SET
-               requests = requests + excluded.requests,
-               prompt_tokens = prompt_tokens + excluded.prompt_tokens,
-               completion_tokens = completion_tokens + excluded.completion_tokens,
-               cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens`
-          ).bind(dayStartEpoch(row.day, this.tzOffset), row.account_id, row.requests || 0,
-            row.prompt_tokens || 0, row.completion_tokens || 0, row.cache_read_tokens || 0).run();
-        }
+      const markerValue = String(migrated?.value || '');
+      const running = markerValue.match(/^running:(\d+):([^:]+)$/);
+      const runningAt = running ? Number(running[1]) : 0;
+      if (migrated?.value !== '1') {
+        const claimRecoverable = !migrated || (!running || !Number.isFinite(runningAt) || runningAt <= 0 || Date.now() - runningAt > D1_MIGRATION_LOCK_MS);
+        if (!claimRecoverable) return false;
+        const now = Date.now();
+        const owner = randomHex(12);
+        const claimValue = `running:${now}:${owner}`;
+        const claim = migrated
+          ? await this.db.prepare("UPDATE usage_meta SET value = ? WHERE key = 'daily_to_bucket_v1' AND value = ?").bind(claimValue, migrated.value).run()
+          : await this.db.prepare("INSERT OR IGNORE INTO usage_meta (key, value) VALUES ('daily_to_bucket_v1', ?)").bind(claimValue).run();
+        if (Number(claim?.meta?.changes || 0) === 0) return false;
         try {
-          await this.db.prepare("INSERT OR IGNORE INTO usage_meta (key, value) VALUES ('daily_to_bucket_v1', '1')").run();
-        } catch (e) {
-          if (!/UNIQUE|PRIMARY KEY/i.test(String(e?.message || e))) throw e;
+          const legacyRows = (await this.db.prepare(
+            'SELECT day, account_id, requests, prompt_tokens, completion_tokens, cache_read_tokens FROM usage_daily ORDER BY day, account_id'
+          ).all()).results || [];
+          for (let i = 0; i < legacyRows.length; i += D1_MIGRATION_BATCH_ROWS) {
+            const batchRows = legacyRows.slice(i, i + D1_MIGRATION_BATCH_ROWS);
+            const statements = batchRows.flatMap((row) => {
+              const migrationKey = `daily_to_bucket_v1:${row.day}:${row.account_id}`;
+              return [
+                this.db.prepare('INSERT OR IGNORE INTO usage_migration_rows (migration_key, day, account_id) VALUES (?, ?, ?)')
+                  .bind(migrationKey, row.day, row.account_id),
+                this.db.prepare(
+                  `INSERT INTO usage_buckets (bucket_start, account_id, requests, prompt_tokens, completion_tokens, cache_read_tokens)
+                   SELECT ?, ?, ?, ?, ?, ? WHERE changes() = 1
+                   ON CONFLICT(bucket_start, account_id) DO UPDATE SET
+                     requests = usage_buckets.requests + excluded.requests,
+                     prompt_tokens = usage_buckets.prompt_tokens + excluded.prompt_tokens,
+                     completion_tokens = usage_buckets.completion_tokens + excluded.completion_tokens,
+                     cache_read_tokens = usage_buckets.cache_read_tokens + excluded.cache_read_tokens`
+                ).bind(dayStartEpoch(row.day, this.tzOffset), row.account_id, row.requests || 0,
+                  row.prompt_tokens || 0, row.completion_tokens || 0, row.cache_read_tokens || 0),
+              ];
+            });
+            if (statements.length) await this.db.batch(statements);
+          }
+          const completed = await this.db.prepare("UPDATE usage_meta SET value = '1' WHERE key = 'daily_to_bucket_v1' AND value = ?").bind(claimValue).run();
+          if (Number(completed?.meta?.changes || 0) === 0) return false;
+        } catch (error) {
+          try {
+            await this.db.prepare("UPDATE usage_meta SET value = ? WHERE key = 'daily_to_bucket_v1' AND value = ?").bind(`failed:${Date.now()}:${owner}`, claimValue).run();
+          } catch { /* expiry-based recovery remains available */ }
+          throw error;
         }
       }
     }
@@ -2629,12 +2888,59 @@ class D1Pool {
 
   async add(key, label) {
     await this.ensureSchema();
-    const dup = await this.db.prepare('SELECT id FROM accounts WHERE api_key = ?').bind(key).first();
-    if (dup) { const e = new Error('该密钥已存在'); e.status = 409; throw e; }
-    const r = await this.db.prepare(
-      'INSERT INTO accounts (api_key, label, created_at) VALUES (?, ?, ?)'
-    ).bind(key, label || '', Date.now()).run();
+    let r;
+    try {
+      r = await this.db.prepare(
+        'INSERT INTO accounts (api_key, label, created_at) VALUES (?, ?, ?)'
+      ).bind(key, label || '', Date.now()).run();
+    } catch (e) {
+      if (/UNIQUE|constraint/i.test(String(e?.message || e))) {
+        const error = new Error('该密钥已存在');
+        error.status = 409;
+        throw error;
+      }
+      throw e;
+    }
     return r.meta && r.meta.last_row_id;
+  }
+  async getCredential(id) {
+    await this.ensureSchema();
+    const row = await this.db.prepare('SELECT api_key FROM accounts WHERE id = ?').bind(id).first();
+    return row?.api_key || null;
+  }
+  async addWithQuota(key, label, report) {
+    await this.ensureSchema();
+    const state = mergeQuotaState({}, report);
+    const insert = this.db.prepare(
+      'INSERT INTO accounts (api_key, label, created_at) VALUES (?, ?, ?)'
+    ).bind(key, label || '', Date.now());
+    const update = this.db.prepare(
+      `UPDATE accounts SET
+         user_name = ?, plan_id = ?, plan_name = ?,
+         monthly_left = ?, purchased = ?, free = ?,
+         five_hour_used = ?, five_hour_cap = ?, five_hour_exceeded = ?, five_hour_reset = ?,
+         weekly_used = ?, weekly_cap = ?, weekly_exceeded = ?, weekly_reset = ?,
+         last_error = ?, detail = ?
+       WHERE api_key = ?`
+    ).bind(
+      state.user_name, state.plan_id, state.plan_name,
+      state.monthly_left, state.purchased, state.free,
+      state.five_hour_used, state.five_hour_cap, state.five_hour_exceeded, state.five_hour_reset,
+      state.weekly_used, state.weekly_cap, state.weekly_exceeded, state.weekly_reset,
+      state.last_error, state.detail, key,
+    );
+    try {
+      await this.db.batch([insert, update]);
+    } catch (e) {
+      if (/UNIQUE|constraint/i.test(String(e?.message || e))) {
+        const error = new Error('该密钥已存在');
+        error.status = 409;
+        throw error;
+      }
+      throw e;
+    }
+    const row = await this.db.prepare('SELECT id FROM accounts WHERE api_key = ?').bind(key).first();
+    return row?.id || null;
   }
 
   async patch(id, { label, enabled }) {
@@ -2648,17 +2954,18 @@ class D1Pool {
     }
     if (!sets.length) return false;
     params.push(id);
-    await this.db.prepare(`UPDATE accounts SET ${sets.join(', ')} WHERE id = ?`).bind(...params).run();
-    return true;
+    const result = await this.db.prepare(`UPDATE accounts SET ${sets.join(', ')} WHERE id = ?`).bind(...params).run();
+    return Number(result?.meta?.changes || 0) > 0;
   }
 
   async remove(id) {
     await this.ensureSchema();
-    await this.db.batch([
-      this.db.prepare('DELETE FROM usage_buckets WHERE account_id = ?').bind(id),
-      this.db.prepare('DELETE FROM accounts WHERE id = ?').bind(id),
-    ]);
-    return true;
+    const result = await this.db.prepare('DELETE FROM accounts WHERE id = ?').bind(id).run();
+    if (Number(result?.meta?.changes || 0) > 0) {
+      await this.db.prepare('DELETE FROM usage_buckets WHERE account_id = ?').bind(id).run();
+      return true;
+    }
+    return false;
   }
 
   async recordSuccess(id, usage) {
@@ -2751,18 +3058,26 @@ class D1Pool {
   }
 
   async seedIfEmpty(keys) {
-    await this.ensureSchema();
-    const row = await this.db.prepare('SELECT COUNT(*) AS n FROM accounts').first();
-    if (row && row.n > 0) return 0;
-    let added = 0;
-    for (const item of keys) {
-      try {
-        await this.db.prepare('INSERT OR IGNORE INTO accounts (api_key, label, created_at) VALUES (?, ?, ?)')
-          .bind(item.key, item.label || '', Date.now()).run();
-        added++;
-      } catch (e) { /* 重复 Key 忽略 */ }
+    const normalized = (keys || []).filter((item) => item && item.key).map((item) => ({ key: String(item.key), label: String(item.label || '') }));
+    if (this._seedPromise) {
+      try { await this._seedPromise; } catch { /* current caller still performs its own idempotent fill */ }
     }
-    return added;
+    if (!normalized.length) return 0;
+    this._seedPromise = (async () => {
+      await this.ensureSchema();
+      let added = 0;
+      for (const item of normalized) {
+        const result = await this.db.prepare('INSERT OR IGNORE INTO accounts (api_key, label, created_at) VALUES (?, ?, ?)')
+          .bind(item.key, item.label, Date.now()).run();
+        if (Number(result?.meta?.changes || 0) > 0) added++;
+      }
+      return added;
+    })();
+    try {
+      return await this._seedPromise;
+    } finally {
+      this._seedPromise = null;
+    }
   }
 }
 
@@ -2821,6 +3136,20 @@ class MemPool {
     });
     return id;
   }
+  async getCredential(id) {
+    return this.accounts.find((a) => a.id === id)?.api_key || null;
+  }
+  async addWithQuota(key, label, report) {
+    const id = await this.add(key, label);
+    try {
+      await this.saveQuota(id, report);
+      return id;
+    } catch (error) {
+      const account = this.accounts.find((a) => a.id === id);
+      if (account?.api_key === key) await this.remove(id);
+      throw error;
+    }
+  }
   async patch(id, { label, enabled }) {
     const a = this.accounts.find((a) => a.id === id);
     if (!a) return false;
@@ -2841,6 +3170,7 @@ class MemPool {
     a.completion_tokens += usage.completion_tokens || 0;
     a.cache_read_tokens += usage.prompt_tokens_details?.cached_tokens || 0;
     a.last_used_at = Date.now(); a.last_error = '';
+    this.pruneBuckets(Math.floor(Date.now() / 1000));
     const bucket = usageBucketStart(Date.now(), this.tzOffset);
     let perAcct = this.buckets.get(bucket);
     if (!perAcct) { perAcct = new Map(); this.buckets.set(bucket, perAcct); }
@@ -2851,8 +3181,18 @@ class MemPool {
     cur.cache_read_tokens += usage.prompt_tokens_details?.cached_tokens || 0;
     perAcct.set(id, cur);
   }
+  pruneBuckets(nowSeconds = Math.floor(Date.now() / 1000)) {
+    const cutoff = nowSeconds - MAX_USAGE_RETENTION_SECONDS;
+    for (const bucketStart of this.buckets.keys()) {
+      if (bucketStart < cutoff) this.buckets.delete(bucketStart);
+    }
+    while (this.buckets.size > Math.ceil(MAX_USAGE_RETENTION_SECONDS / USAGE_BUCKET_SECONDS) + 1) {
+      this.buckets.delete(this.buckets.keys().next().value);
+    }
+  }
   async dailyUsage(range = '1d') {
     const info = normalizeUsageRange(range);
+    this.pruneBuckets(Math.floor(Date.now() / 1000));
     const cutoff = Math.floor(Date.now() / 1000) - info.seconds;
     const labels = {};
     for (const a of this.accounts) labels[a.id] = a.label || a.user_name || '';
@@ -2911,7 +3251,6 @@ function parseAccountsEnv(raw) {
 // 同一 isolate 的多次请求间保持；D1 池避免每个请求重复建表。
 const d1Pools = new WeakMap();
 const memPools = new WeakMap();
-const seededDbs = new WeakSet();
 function getPool(env) {
   const tz = Number.isFinite(Number(env.TIMEZONE_OFFSET)) ? Number(env.TIMEZONE_OFFSET) : DEFAULT_TZ_OFFSET;
   if (env.DB) {
@@ -3394,66 +3733,72 @@ async function handleGenerate(request, env, ctx, kind) {
     exclude.push(acct.id);
 
     const abortController = new AbortController();
+    const onClientAbort = () => abortController.abort(request.signal.reason);
+    if (request.signal.aborted) return kindError(kind, 499, 'server_error', 'client closed request');
+    request.signal.addEventListener('abort', onClientAbort, { once: true });
     let resp;
+    let streamHandedOff = false;
     try {
       await ensureInitialized(acct.api_key, env, abortController.signal);
       resp = await forwardToCC(env, ccBody, acct.api_key, request, abortController.signal, promptCacheKey);
+      if (!resp.ok) {
+        let errText = '';
+        try { errText = await readLimitedText(resp, MAX_UPSTREAM_JSON_BYTES, abortController.signal); }
+        catch { lastFailure = new UpstreamFailure('retry', transportError('upstream error response is too large')); continue; }
+        const mapped = mapCcError(resp.status, errText);
+        const failure = classifyHttpFailure(resp.status, mapped, extractRetryAfterSec(resp.status, errText, resp.headers));
+        if (failure.kind === 'request') return mappedErrorResponse(kind, mapped);
+        await applyFailure(pool, acct, failure);
+        lastFailure = failure;
+        continue;
+      }
+      if (stream) {
+        const streamAttempt = startStreamAttempt(kind, resp, meta, cfg, abortController, async (usage) => {
+          const persist = pool.recordSuccess(acct.id, usage).catch((e) => {
+            console.error(JSON.stringify({ message: 'failed to record request usage', error: e instanceof Error ? e.message : String(e) }));
+          });
+          if (ctx && ctx.waitUntil) ctx.waitUntil(persist);
+        });
+        const outcome = await streamAttempt.outcome;
+        if (outcome.started) {
+          streamHandedOff = true;
+          const cleanup = () => request.signal.removeEventListener('abort', onClientAbort);
+          const done = outcome.done.then(cleanup, cleanup);
+          if (ctx && ctx.waitUntil) ctx.waitUntil(done);
+          else void done;
+          return new Response(streamAttempt.readable, { status: 200, headers: SSE_HEADERS });
+        }
+        const failure = outcome.failure;
+        if (failure.kind === 'request') return mappedErrorResponse(kind, failure.mapped);
+        await applyFailure(pool, acct, failure);
+        lastFailure = failure;
+        continue;
+      }
+      const attempt = await runCollectAttempt(kind, resp, cfg);
+      if (attempt.failure) {
+        const failure = attempt.failure;
+        if (failure.kind === 'request') return mappedErrorResponse(kind, failure.mapped);
+        await applyFailure(pool, acct, failure);
+        lastFailure = failure;
+        continue;
+      }
+      const usage = collectedUsageOpenAI(attempt.collected.usage);
+      const record = pool.recordSuccess(acct.id, usage).catch((e) => {
+        console.error(JSON.stringify({ message: 'failed to record request usage', error: e instanceof Error ? e.message : String(e) }));
+      });
+      if (ctx && ctx.waitUntil) ctx.waitUntil(record);
+      else await record;
+      return json(await buildNonStreamResponse(kind, meta, attempt.collected));
     } catch (e) {
-      if (e && e.name === 'AbortError') continue; // 客户端断连：不再换号
+      if (e && e.name === 'AbortError') {
+        if (request.signal.aborted || abortController.signal.aborted) throw e;
+        continue;
+      }
       lastFailure = new UpstreamFailure('retry', transportError((e && e.message) || String(e)));
       continue;
+    } finally {
+      if (!streamHandedOff) request.signal.removeEventListener('abort', onClientAbort);
     }
-
-    if (!resp.ok) {
-      let errText = '';
-      try { errText = await readLimitedText(resp); }
-      catch { lastFailure = new UpstreamFailure('retry', transportError('upstream error response is too large')); continue; }
-      const mapped = mapCcError(resp.status, errText);
-      const failure = classifyHttpFailure(
-        resp.status, mapped,
-        extractRetryAfterSec(resp.status, errText, resp.headers),
-      );
-      if (failure.kind === 'request') return mappedErrorResponse(kind, mapped);
-      await applyFailure(pool, acct, failure);
-      lastFailure = failure;
-      continue;
-    }
-
-    if (stream) {
-      const attempt = startStreamAttempt(kind, resp, meta, cfg, abortController, async (usage) => {
-        const persist = pool.recordSuccess(acct.id, usage).catch((e) => {
-          console.error(JSON.stringify({ message: 'failed to record request usage', error: e instanceof Error ? e.message : String(e) }));
-        });
-        if (ctx && ctx.waitUntil) ctx.waitUntil(persist);
-      });
-      const outcome = await attempt.outcome;
-      if (outcome.started) {
-        if (ctx && ctx.waitUntil) ctx.waitUntil(outcome.done);
-        return new Response(attempt.readable, { status: 200, headers: SSE_HEADERS });
-      }
-      const failure = outcome.failure;
-      if (failure.kind === 'request') return mappedErrorResponse(kind, failure.mapped);
-      await applyFailure(pool, acct, failure);
-      lastFailure = failure;
-      continue;
-    }
-
-    const attempt = await runCollectAttempt(kind, resp, cfg);
-    if (attempt.failure) {
-      const failure = attempt.failure;
-      if (failure.kind === 'request') return mappedErrorResponse(kind, failure.mapped);
-      await applyFailure(pool, acct, failure);
-      lastFailure = failure;
-      continue;
-    }
-
-    const usage = collectedUsageOpenAI(attempt.collected.usage);
-    const record = pool.recordSuccess(acct.id, usage).catch((e) => {
-      console.error(JSON.stringify({ message: 'failed to record request usage', error: e instanceof Error ? e.message : String(e) }));
-    });
-    if (ctx && ctx.waitUntil) ctx.waitUntil(record);
-    else await record;
-    return json(await buildNonStreamResponse(kind, meta, attempt.collected));
   }
 
   if (lastFailure && lastFailure.mapped) return mappedErrorResponse(kind, lastFailure.mapped);
@@ -3498,8 +3843,8 @@ const MODELS = [
   { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
 ];
 
-const modelCatalogCache = new Map();
-
+const modelCatalogCache = new IsolateCache(MAX_MODEL_CACHE_ENTRIES, MODEL_CACHE_TTL_MS);
+const modelCatalogFlights = new Map();
 function toModelEntry(m) {
   return {
     id: m.id,
@@ -3510,51 +3855,73 @@ function toModelEntry(m) {
   };
 }
 
-async function fetchModels(base, apiKey) {
-  const resp = await fetch(base + '/provider/v1/models', {
+async function fetchModels(base, apiKey, signal, timeoutMs = DEFAULT_CONTROL_PLANE_TIMEOUT_MS) {
+  return upstreamFetch(base + '/provider/v1/models', {
     headers: {
       'Authorization': 'Bearer ' + apiKey,
       'x-cli-environment': 'production',
       'x-command-code-version': CC_PROTOCOL_VERSION,
     },
-    signal: AbortSignal.timeout(10000),
+  }, {
+    signal,
+    timeoutMs,
+    consume: async (response, bodySignal) => {
+      const text = await readLimitedText(response, MAX_UPSTREAM_JSON_BYTES, bodySignal);
+      if (!response.ok) throw new Error('models: HTTP ' + response.status);
+      let list;
+      try { list = JSON.parse(text); }
+      catch { throw new Error('models: invalid JSON response'); }
+      const data = Array.isArray(list?.data) ? list.data : [];
+      return data.map((m) => ({
+        id: m.id,
+        object: 'model',
+        created: 1700000000,
+        owned_by: 'commandcode',
+        context_window: m.context_length,
+      }));
+    },
   });
-  if (!resp.ok) throw new Error('models: HTTP ' + resp.status);
-  const text = await readLimitedText(resp);
-  let list;
-  try { list = JSON.parse(text); }
-  catch (e) { throw new Error('models: invalid JSON response'); }
-  const data = Array.isArray(list?.data) ? list.data : [];
-  return data.map((m) => ({
-    id: m.id,
-    object: 'model',
-    created: 1700000000,
-    owned_by: 'commandcode',
-    context_window: m.context_length,
-  }));
 }
 
-async function getModels(env, base) {
-  const now = Date.now();
-  const cached = modelCatalogCache.get(base);
-  if (cached && now - cached.at < MODEL_CACHE_TTL_MS) {
-    return cached.data;
-  }
+async function getModels(env, base, signal) {
+  const cfg = getConfig(env);
   const pool = getPool(env);
   const keys = await pool.availableKeys();
   for (const key of keys) {
-    try {
-      const data = await fetchModels(base, key);
-      modelCatalogCache.set(base, { at: now, data });
-      return data;
-    } catch (e) {
-      // 目录请求是只读操作；当前账号不可用时继续尝试其他账号。
+    const flightKey = structuredScopeKey(base, key);
+    const active = modelCatalogFlights.get(flightKey);
+    if (active) {
+      try { return await waitForSharedFlight(active, signal); } catch (e) {
+        if (signal?.aborted || e?.name === 'AbortError') throw e;
+        continue;
+      }
+    }
+    const promise = (async () => {
+      const sharedController = new AbortController();
+      const timer = setTimeout(() => sharedController.abort(controlPlaneTimeoutError(`${base}/models`)), cfg.controlPlaneTimeoutMs);
+      try {
+        const cacheKey = await digestCacheKey('models', structuredScopeKey(base, key));
+        const cached = modelCatalogCache.get(cacheKey);
+        if (cached) return cached;
+        const data = await fetchModels(base, key, sharedController.signal, cfg.controlPlaneTimeoutMs);
+        modelCatalogCache.set(cacheKey, data);
+        return data;
+      } finally {
+        clearTimeout(timer);
+        if (!sharedController.signal.aborted) sharedController.abort();
+      }
+    })();
+    modelCatalogFlights.set(flightKey, promise);
+    promise.finally(() => { if (modelCatalogFlights.get(flightKey) === promise) modelCatalogFlights.delete(flightKey); }).catch(() => {});
+    try { return await waitForSharedFlight(promise, signal); } catch (e) {
+      if (signal?.aborted || e?.name === 'AbortError') throw e;
+      /* try the next enabled credential */
     }
   }
-  // 全部失败：过期缓存 > 硬编码兜底
-  if (cached && cached.data.length) return cached.data;
   return MODELS.map(toModelEntry);
 }
+
+
 
 // ============================ §P 鉴权与 admin ============================
 
@@ -3625,29 +3992,31 @@ async function buildPoolState(env, pool, accountList) {
 
 // 验证并入库一把 Command Code 密钥（手动粘贴与浏览器登录共用）。
 // 失败抛出带 status 的 Error。
-async function provisionAccount(env, key, label) {
-  const base = getConfig(env).apiBase;
+async function provisionAccount(env, key, label, signal) {
+  const cfg = getConfig(env);
   const pool = getPool(env);
   if (!/^[\x21-\x7e]+$/.test(key)) {
     const e = new Error('密钥格式不对：检测到中文或全角字符。密钥应是纯 ASCII 字符串，请重新复制粘贴。');
     e.status = 400;
     throw e;
   }
-  // 先注册设备指纹，再验证额度，最后入库
-  try { await ensureInitialized(key, env); } catch { /* best-effort */ }
+  // 先注册设备指纹，再验证额度，最后由池以一个原子操作入库。
+  try { await ensureInitialized(key, env, signal); } catch (e) {
+    if (e?.name === 'AbortError' && signal?.aborted) throw e;
+    console.warn(JSON.stringify({ message: 'initialization best-effort failed', error: e instanceof Error ? e.message : String(e) }));
+  }
   let report;
-  try { report = await fetchReport(base, key); }
+  try { report = await fetchReport(cfg.apiBase, key, signal, cfg.controlPlaneTimeoutMs); }
   catch (e) {
     const err = new Error(e.message || '验证失败');
-    err.status = e.status === 401 || e.status === 403 ? 400 : 502;
+    err.status = e.status === 401 || e.status === 403 ? 400 : (e.status || 502);
     throw err;
   }
-  const id = await pool.add(key, label || report.account?.userName || maskKey(key));
-  await pool.saveQuota(id, report);
-  return id;
+  return pool.addWithQuota(key, label || report.account?.userName || maskKey(key), report);
 }
 
 async function handleAdmin(request, env, ctx, url) {
+  const base = getConfig(env).apiBase;
   const path = url.pathname;
   const pool = getPool(env);
 
@@ -3671,7 +4040,7 @@ async function handleAdmin(request, env, ctx, url) {
     const label = String(body.label || '').trim().slice(0, 60);
     if (!key) return json({ error: 'missing key' }, 400);
     let id;
-    try { id = await provisionAccount(env, key, label); }
+    try { id = await provisionAccount(env, key, label, request.signal); }
     catch (e) { return json({ error: e.message || '验证失败' }, e.status || 502); }
     const accounts = await pool.list();
     return json({ account: accounts.find((a) => a.id === id) || null }, 201);
@@ -3704,22 +4073,29 @@ async function handleAdmin(request, env, ctx, url) {
     if (body.id != null && !targets.length) return json({ error: '账号不存在' }, 404);
 
     const refreshOne = async (a) => {
-      // 需要明文密钥：内存池直接取；D1 池重新查该行
-      let apiKey;
-      if (pool instanceof MemPool) apiKey = pool.accounts.find((x) => x.id === a.id)?.api_key;
-      else {
-        const row = await env.DB.prepare('SELECT api_key FROM accounts WHERE id = ?').bind(a.id).first();
-        apiKey = row?.api_key;
-      }
-      if (!apiKey) return { ...a, lastError: 'account not found' };
+      const deadline = new AbortController();
+      const onClientAbort = () => deadline.abort(request.signal.reason);
+      const timeoutMs = getConfig(env).controlPlaneTimeoutMs * 4;
+      const timer = setTimeout(() => deadline.abort(controlPlaneTimeoutError(`${base}/refresh/${a.id}`)), timeoutMs);
+      request.signal.addEventListener('abort', onClientAbort, { once: true });
       try {
-        try { await ensureInitialized(apiKey, env); } catch { /* best-effort */ }
-        const report = await fetchReport(base, apiKey);
+        const apiKey = await pool.getCredential(a.id);
+        if (!apiKey) return { ...a, lastError: 'account not found' };
+        try { await ensureInitialized(apiKey, env, deadline.signal); } catch (e) {
+          if (request.signal.aborted || e?.name === 'AbortError' || e?.name === 'TimeoutError') throw e;
+          console.warn(JSON.stringify({ message: 'refresh initialization failed', accountId: a.id, error: e instanceof Error ? e.message : String(e) }));
+        }
+        const report = await fetchReport(base, apiKey, deadline.signal, getConfig(env).controlPlaneTimeoutMs);
         await pool.saveQuota(a.id, report);
         return (await pool.list()).find((x) => x.id === a.id) || { ...a, lastError: '' };
       } catch (e) {
+        if (request.signal.aborted || e?.name === 'AbortError' || e?.name === 'TimeoutError' || deadline.signal.aborted) throw e;
         await pool.markQuotaError(a.id, e.message || String(e));
         return (await pool.list()).find((x) => x.id === a.id) || { ...a, lastError: e.message || String(e) };
+      } finally {
+        clearTimeout(timer);
+        request.signal.removeEventListener('abort', onClientAbort);
+        deadline.abort();
       }
     };
     // 子请求数限制：最多并发刷 12 个
@@ -3761,16 +4137,13 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const base = getConfig(env).apiBase;
+    const needsPool = path.startsWith('/v1/') || path === '/api/accounts' || path.startsWith('/api/accounts/') || path === '/api/refresh' || path === '/api/state' || path === '/api/usage/daily' || path === '/v1/models';
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: JSON_HEADERS });
 
     maybeCheckProtocolDrift();
 
     // ACCOUNTS 环境变量作为 D1 号池的引导：首次（每 isolate 一次）自动入库
-    if (env.DB && env.ACCOUNTS && !seededDbs.has(env.DB)) {
-      seededDbs.add(env.DB);
-      try { await getPool(env).seedIfEmpty(parseAccountsEnv(env.ACCOUNTS)); } catch (e) { /* ignore */ }
-    }
 
     // 健康检查（无需鉴权）
     if (path === '/health') return json({ status: 'ok' });
@@ -3782,10 +4155,12 @@ export default {
         return errorResponse(503, 'server_error', 'client authentication is not configured', 'auth_not_configured');
       }
       if (!(await checkClientAuth(request, env))) return errorResponse(401, 'authentication_error', 'invalid api key');
+      if (needsPool && env.DB && env.ACCOUNTS) await getPool(env).seedIfEmpty(parseAccountsEnv(env.ACCOUNTS));
       const kind = path === '/v1/chat/completions' ? 'chat' : (path === '/v1/messages' ? 'messages' : 'responses');
       try {
         return await handleGenerate(request, env, ctx, kind);
       } catch (e) {
+        if (request.signal.aborted || e?.name === 'AbortError') throw e;
         console.error(JSON.stringify({ message: 'generate request failed', error: e instanceof Error ? e.message : String(e), kind }));
         return errorResponse(500, 'server_error', 'internal server error', 'internal_error');
       }
@@ -3796,10 +4171,12 @@ export default {
         return errorResponse(503, 'server_error', 'client authentication is not configured', 'auth_not_configured');
       }
       if (!(await checkClientAuth(request, env))) return errorResponse(401, 'authentication_error', 'invalid api key');
+      if (needsPool && env.DB && env.ACCOUNTS) await getPool(env).seedIfEmpty(parseAccountsEnv(env.ACCOUNTS));
       let data;
       try {
-        data = await getModels(env, base);
+        data = await getModels(env, base, request.signal);
       } catch (e) {
+        if (request.signal.aborted || e?.name === 'AbortError') throw e;
         console.error(JSON.stringify({ message: 'model catalog request failed', error: e instanceof Error ? e.message : String(e) }));
         return errorResponse(502, 'server_error', 'model catalog unavailable', 'model_catalog_error');
       }
@@ -3816,8 +4193,10 @@ export default {
         return json({ error: 'admin-required', message: '需要访问令牌' }, 401);
       }
       try {
+        if (needsPool && env.DB && env.ACCOUNTS) await getPool(env).seedIfEmpty(parseAccountsEnv(env.ACCOUNTS));
         return await handleAdmin(request, env, ctx, url);
       } catch (e) {
+        if (request.signal.aborted || e?.name === 'AbortError') throw e;
         console.error(JSON.stringify({ message: 'admin request failed', error: e instanceof Error ? e.message : String(e), path }));
         return json({ error: e.status && e.status >= 400 && e.status < 600 ? (e.message || 'request failed') : 'internal server error' }, e.status && e.status >= 400 && e.status < 600 ? e.status : 500);
       }

@@ -61,3 +61,9 @@ CREATE TABLE IF NOT EXISTS usage_meta (
   value TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts(enabled, rate_limited_until);
+CREATE TABLE IF NOT EXISTS usage_migration_rows (
+  migration_key TEXT NOT NULL,
+  day TEXT NOT NULL,
+  account_id INTEGER NOT NULL,
+  PRIMARY KEY (migration_key, day, account_id)
+);
