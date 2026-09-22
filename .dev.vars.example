@@ -16,11 +16,6 @@ POOL_STRATEGY=sticky
 
 # 未绑定 D1 时的内存号池（JSON 数组或逗号分隔 Key 列表）
 # mock_server.py 按 key 里的形态名选择应答：
-#   sk-ok-* 正常 | sk-zero-* 零输出 | sk-partial-* 流中断(无 finish)
-#   sk-tool-* 工具调用 | sk-streamerr-* 流内错误(<429>) | sk-slow-* 慢速(触发空闲超时)
-#   sk-snake-* snake_case usage | sk-exhausted-* 402 | sk-limited-* 429
+#   sk-ok-* 正常 | sk-streamerr-* 流内错误 | sk-exhausted-* 402 | sk-limited-* 429
 #   sk-badkey-* 401 | sk-forbidden-* 403 | sk-badrequest-* 400
 ACCOUNTS=[{"key":"cc-ok-1","label":"ok1"},{"key":"cc-ok-2","label":"ok2"}]
-
-# 本地开发用的指纹盐（换成任意字符串即批量更换伪造设备身份）
-FINGERPRINT_SALT=dev-salt

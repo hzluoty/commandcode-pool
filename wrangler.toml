@@ -11,28 +11,18 @@ main = "worker.js"
 compatibility_date = "2026-09-01"
 
 # 静态页面：public/ 目录由 wrangler 直接托管（/ → index.html，/admin → admin.html）。
-# 未命中静态资源的请求（/v1/*、/api/*、/health）落到 worker.js。
+# 未命中静态资源的请求（/v1/*、/provider/v1/*、/api/*、/health）落到 worker.js。
 [assets]
 directory = "./public"
 
 [vars]
-# 上游地址（开发时可用 .dev.vars 覆盖指向本地 mock_server.py）
+# 上游地址：Command Code 官方公开 Provider API（开发时可用 .dev.vars 覆盖指向本地 mock_server.py）
 API_BASE = "https://api.commandcode.ai"
 
-# 账号调度策略：
-#   sticky      默认。粘住单账号直至额度耗尽（429/401），缓存最友好
-#   round_robin 最久未用优先，均摊负载（牺牲 prompt cache 命中）
+# 账号初选策略（单次请求严格只选择一个账号尝试一次，绝不跨账号重放）：
+#   sticky      默认。粘性选择最近活跃账号，提示词缓存友好
+#   round_robin 最久未用优先，均摊初始请求
 POOL_STRATEGY = "sticky"
-
-# 设备指纹盐：非空时成批更换所有账号的伪造设备身份（逃生口；留空保持稳定身份）
-FINGERPRINT_SALT = ""
-
-# 上游读空闲超时（毫秒）：流式 / 非流式。超时按 429 rate_limit_error 返回并可触发换号
-STREAM_IDLE_MS = "30000"
-NONSTREAM_IDLE_MS = "90000"
-
-# 客户端未提供 system 时，是否发送占位 system（' '）阻止上游注入默认 system prompt（省额度）
-EMPTY_SYSTEM_PLACEHOLDER = "true"
 
 # 时区偏移（小时，用于 /api/usage/daily 的分桶标签；默认 UTC+8）
 # TIMEZONE_OFFSET = "8"
@@ -44,7 +34,7 @@ EMPTY_SYSTEM_PLACEHOLDER = "true"
 # ACCOUNTS   = ""   # 未绑定 D1 时的内存号池：JSON 数组 [{"key":"...","label":"..."}]
 #                   # 或逗号分隔的 Command Code API Key 列表
 
-# D1：账号、额度缓存、用量与冷却状态持久化（跨 isolate 一致，推荐）。
+# D1：账号、用量与冷却状态持久化（跨 isolate 一致，推荐）。
 # database_id 为空时由 deploy.sh 自动创建回填；手动部署：
 #   npx wrangler d1 create commandcode-pool   # 把输出的 database_id 粘到下面
 [[d1_databases]]
