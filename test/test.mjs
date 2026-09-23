@@ -24,6 +24,7 @@ import { createProviderFailurePolicy, ClientInputError } from '../lib/failure-po
 import { sendGeneration, providerUrl, PROVIDER_GENERATION_PATHS } from '../lib/upstream-client.js';
 import { runSingleAccountGeneration, createSseObserverTransform } from '../lib/generation-runner.js';
 import { selectSingleAccount, persistAccountHealth, unavailableAccountResponse } from '../lib/pool-store.js';
+import { planInfo, normalizeWindow, buildDetail } from '../lib/quota-client.js';
 
 let passed = 0;
 let failed = 0;
@@ -102,6 +103,35 @@ function installProviderMock({ behavior = {} } = {}) {
           { id: 'claude-sonnet-4-6', object: 'model' },
         ],
       });
+    }
+
+    // Quota endpoints
+    if (urlStr.includes('/alpha/')) {
+      const ab = behavior[`alpha:${apiKey}`] || b;
+      if (ab === 'badkey') {
+        return jsonResponse({ error: { message: 'unauthorized', type: 'authentication_error' } }, 401);
+      }
+      if (ab === 'limited') {
+        return jsonResponse({ error: { message: 'rate limited', type: 'rate_limit_error' } }, 429, { 'Retry-After': '120' });
+      }
+      if (ab === 'server_error') {
+        return jsonResponse({ error: { message: 'upstream error', type: 'server_error' } }, 500);
+      }
+      if (urlStr.endsWith('/alpha/whoami')) {
+        return jsonResponse({ user: { id: 'u1', name: 'User 1', userName: 'tester' } });
+      }
+      if (urlStr.endsWith('/alpha/billing/credits')) {
+        return jsonResponse({
+          credits: { monthlyCredits: 50, purchasedCredits: 5, freeCredits: 1 },
+          windowLimits: { fiveHour: { used: 1, cap: 5 }, weekly: { used: 5, cap: 30 } },
+        });
+      }
+      if (urlStr.includes('/alpha/billing/subscriptions')) {
+        return jsonResponse({ data: { planId: 'individual-goat', status: 'active', currentPeriodEnd: 1800000000000 } });
+      }
+      if (urlStr.endsWith('/alpha/usage/summary')) {
+        return jsonResponse({ data: { totalCount: 10, totalCost: 1.2 } });
+      }
     }
 
     // Generation endpoints
@@ -771,6 +801,140 @@ async function testD1E2E() {
   }
 }
 
+async function testQuotaClientAndStorage() {
+  console.log('--- testQuotaClientAndStorage ---');
+
+  // 1. planInfo mapping
+  assertEq(planInfo('individual-go')?.monthlyCredits, 10, 'planInfo: individual-go is 10');
+  assertEq(planInfo('individual-goat')?.monthlyCredits, 70, 'planInfo: individual-goat is 70');
+  assertEq(planInfo('individual-pro-v1')?.monthlyCredits, 80, 'planInfo: individual-pro-v1 is 80 (longest prefix)');
+  assertEq(planInfo('individual-pro')?.monthlyCredits, 30, 'planInfo: individual-pro is 30');
+  assertEq(planInfo('unknown-plan'), undefined, 'planInfo: unknown plan is undefined');
+
+  // 2. normalizeWindow
+  const norm = normalizeWindow({ used: 2.5, cap: 5.0, resetAt: 1700000000000 });
+  assertEq(norm.used, 2.5, 'normalizeWindow: used');
+  assertEq(norm.cap, 5.0, 'normalizeWindow: cap');
+  assertEq(norm.exceeded, false, 'normalizeWindow: not exceeded');
+  assertEq(norm.resetAt, 1700000000000, 'normalizeWindow: resetAt');
+
+  // 3. MemPool saveQuota and rowToAccount
+  const pool = new MemPool([{ key: 'k1', label: 'Account 1' }]);
+  const report = {
+    account: { userName: 'user-goat' },
+    plan: { planId: 'individual-goat', name: 'GOAT' },
+    credits: {
+      monthlyCredits: 65,
+      purchasedCredits: 10,
+      freeCredits: 2,
+      fiveHour: { used: 1, cap: 5, exceeded: false, resetAt: 123456 },
+      weekly: { used: 10, cap: 40, exceeded: false, resetAt: 234567 },
+    },
+    usage: { totalCount: 42, totalCost: 5 },
+  };
+  await pool.saveQuota(1, report);
+  const list = await pool.list();
+  const acc = list[0];
+  assertEq(acc.user_name, 'user-goat', 'saveQuota: MemPool userName updated');
+  assertEq(acc.plan?.planId, 'individual-goat', 'saveQuota: MemPool planId updated');
+  assertEq(acc.plan?.monthlyCredits, 70, 'saveQuota: MemPool plan.monthlyCredits derived from planInfo');
+  assertEq(acc.credits?.monthlyCredits, 65, 'saveQuota: MemPool monthlyCredits stored');
+  assertEq(acc.credits?.fiveHour?.used, 1, 'saveQuota: MemPool fiveHour.used');
+  assertEq(acc.credits?.weekly?.cap, 40, 'saveQuota: MemPool weekly.cap');
+}
+
+async function testAdminRefreshAndQuotaIntegration() {
+  console.log('--- testAdminRefreshAndQuotaIntegration ---');
+  const mock = installProviderMock({
+    behavior: {
+      'acc-ok': 'ok',
+      'acc-429': 'limited',
+      'acc-401': 'badkey',
+      'acc-quota-429': 'ok',
+      'alpha:acc-quota-429': 'limited',
+      'acc-transient': 'ok',
+      'alpha:acc-transient': 'server_error',
+    },
+  });
+
+  try {
+    const env = {
+      API_BASE: 'https://api.commandcode.ai',
+      ADMIN_TOKEN: 'sec',
+      ACCOUNTS: JSON.stringify([
+        { key: 'acc-ok', label: 'OK' },
+        { key: 'acc-429', label: 'RateLimitedModels' },
+        { key: 'acc-401', label: 'InvalidModels' },
+        { key: 'acc-quota-429', label: 'QuotaRateLimited' },
+        { key: 'acc-transient', label: 'TransientErr' },
+      ]),
+    };
+
+    // 1. Refresh acc-ok -> fetches quota, populates monthlyCredits, plan, etc.
+    const res1 = await worker.fetch(new Request('https://gateway.test/api/refresh', {
+      method: 'POST',
+      headers: { 'x-admin-token': 'sec', 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 1 }),
+    }), env);
+    assertEq(res1.status, 200, 'refresh: 200 for acc-ok');
+    const data1 = await res1.json();
+    const acc1 = data1.accounts[0];
+    assertEq(acc1.user_name, 'tester', 'refresh: populated user_name');
+    assertEq(acc1.credits?.monthlyCredits, 50, 'refresh: populated monthlyCredits');
+    assertEq(acc1.plan?.name, 'GOAT', 'refresh: populated plan name');
+    assertEq(acc1.plan?.monthlyCredits, 70, 'refresh: derived monthlyCredits 70 from planInfo');
+    assert(acc1.detail?.lastChecked > 0, 'refresh: detail lastChecked populated');
+
+    // 2. Refresh acc-429 -> models returns 429 -> placed on cooldown
+    const res2 = await worker.fetch(new Request('https://gateway.test/api/refresh', {
+      method: 'POST',
+      headers: { 'x-admin-token': 'sec', 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 2 }),
+    }), env);
+    assertEq(res2.status, 200, 'refresh: returns 200 with refreshed status');
+    const data2 = await res2.json();
+    const acc2 = data2.accounts[0];
+    assert(acc2.pool.rateLimited, 'refresh: models 429 puts account on cooldown');
+
+    // 3. Refresh acc-401 -> models returns 401 -> account disabled
+    const res3 = await worker.fetch(new Request('https://gateway.test/api/refresh', {
+      method: 'POST',
+      headers: { 'x-admin-token': 'sec', 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 3 }),
+    }), env);
+    assertEq(res3.status, 200, 'refresh: returns 200');
+    const data3 = await res3.json();
+    const acc3 = data3.accounts[0];
+    assertEq(acc3.enabled, false, 'refresh: models 401 disables account');
+
+    // 4. Refresh acc-quota-429 -> models is ok, quota returns 429 (Retry-After: 120) -> placed on cooldown
+    const res4 = await worker.fetch(new Request('https://gateway.test/api/refresh', {
+      method: 'POST',
+      headers: { 'x-admin-token': 'sec', 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 4 }),
+    }), env);
+    assertEq(res4.status, 200, 'refresh: returns 200');
+    const data4 = await res4.json();
+    const acc4 = data4.accounts[0];
+    assert(acc4.pool.rateLimited, 'refresh: quota 429 short-circuits and puts account on cooldown');
+
+    // 5. Refresh acc-transient -> models is ok, quota returns 500 -> stays enabled, sets lastError
+    const res5 = await worker.fetch(new Request('https://gateway.test/api/refresh', {
+      method: 'POST',
+      headers: { 'x-admin-token': 'sec', 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 5 }),
+    }), env);
+    assertEq(res5.status, 200, 'refresh: returns 200');
+    const data5 = await res5.json();
+    const acc5 = data5.accounts[0];
+    assertEq(acc5.enabled, true, 'refresh: transient error keeps account enabled');
+    assertEq(acc5.pool.rateLimited, false, 'refresh: transient error does not cooldown account');
+    assert(acc5.lastError.includes('500') || acc5.lastError.includes('无法访问'), 'refresh: lastError recorded transient error');
+  } finally {
+    mock.restore();
+  }
+}
+
 async function runAll() {
   console.log('=== Running commandcode-pool Test Suite ===\n');
   await testApiAdapters();
@@ -781,6 +945,8 @@ async function runAll() {
   await testWorkerE2E();
   await testAdminAndPool();
   await testD1E2E();
+  await testQuotaClientAndStorage();
+  await testAdminRefreshAndQuotaIntegration();
 
   console.log(`\n=== Test Results: ${passed} passed, ${failed} failed ===`);
   if (failed > 0) {

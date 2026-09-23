@@ -710,7 +710,10 @@
     if (!asciiOnly) { appError('密钥格式不对：检测到中文或全角字符，请重新复制粘贴。'); return; }
     $('add-btn').disabled = true;
     try {
-      await api('/api/accounts', { method: 'POST', body: JSON.stringify({ key: key, label: label }) });
+      var res = await api('/api/accounts', { method: 'POST', body: JSON.stringify({ key: key, label: label }) });
+      if (res && res.account && res.account.id) {
+        api('/api/refresh', { method: 'POST', body: JSON.stringify({ id: res.account.id }) }).catch(function () {});
+      }
       $('add-key').value = ''; $('add-label').value = '';
       appError('');
       await loadQuota();

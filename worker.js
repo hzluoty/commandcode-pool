@@ -8,6 +8,7 @@ import { createProviderFailurePolicy, ClientInputError } from './lib/failure-pol
 import { runSingleAccountGeneration } from './lib/generation-runner.js';
 import { sendGeneration } from './lib/upstream-client.js';
 import { selectSingleAccount, unavailableAccountResponse, persistAccountHealth } from './lib/pool-store.js';
+import { planInfo, buildDetail, fetchAccountQuota } from './lib/quota-client.js';
 
 // ============================ 常量与配置 ============================
 
@@ -314,7 +315,7 @@ function rowToAccount(row) {
     plan: row.plan_id || row.plan_name ? {
       planId: row.plan_id,
       name: row.plan_name || row.plan_id,
-      monthlyCredits: null,
+      monthlyCredits: planInfo(row.plan_id)?.monthlyCredits ?? null,
     } : null,
     credits: {
       monthlyCredits: row.monthly_left,
@@ -635,6 +636,34 @@ class D1Pool {
     await this.db.prepare('UPDATE accounts SET last_error = ? WHERE id = ?').bind(message, id).run();
   }
 
+  async saveQuota(id, report) {
+    await this.ensureSchema();
+    const c = report.credits || {};
+    const fh = c.fiveHour || {}, wk = c.weekly || {};
+    const p = report.plan || {};
+    const uName = report.account?.userName || '';
+    const pId = p.planId || '';
+    const pName = p.name || '';
+    const detail = buildDetail(report);
+    await this.db.prepare(
+      `UPDATE accounts SET
+         user_name = COALESCE(NULLIF(?, ''), user_name),
+         plan_id = COALESCE(NULLIF(?, ''), plan_id),
+         plan_name = COALESCE(NULLIF(?, ''), plan_name),
+         monthly_left = ?, purchased = ?, free = ?,
+         five_hour_used = ?, five_hour_cap = ?, five_hour_exceeded = ?, five_hour_reset = ?,
+         weekly_used = ?, weekly_cap = ?, weekly_exceeded = ?, weekly_reset = ?,
+         detail = ?, last_error = ''
+       WHERE id = ?`
+    ).bind(
+      uName, pId, pName,
+      c.monthlyCredits ?? null, c.purchasedCredits ?? null, c.freeCredits ?? null,
+      fh.used ?? null, fh.cap ?? null, fh.exceeded ? 1 : 0, fh.resetAt ?? 0,
+      wk.used ?? null, wk.cap ?? null, wk.exceeded ? 1 : 0, wk.resetAt ?? 0,
+      detail, id,
+    ).run();
+  }
+
   async seedIfEmpty(keys) {
     const normalized = (keys || []).filter((item) => item && item.key).map((item) => ({ key: String(item.key), label: String(item.label || '') }));
     if (this._seedPromise) {
@@ -866,6 +895,31 @@ class MemPool {
     if (a) a.last_error = message;
   }
 
+  async saveQuota(id, report) {
+    const a = this.accounts.find((x) => x.id === id);
+    if (!a) return false;
+    const c = report.credits || {};
+    const fh = c.fiveHour || {}, wk = c.weekly || {};
+    const p = report.plan || {};
+    if (report.account?.userName) a.user_name = report.account.userName;
+    if (p.planId) a.plan_id = p.planId;
+    if (p.name) a.plan_name = p.name;
+    a.monthly_left = c.monthlyCredits ?? null;
+    a.purchased = c.purchasedCredits ?? null;
+    a.free = c.freeCredits ?? null;
+    a.five_hour_used = fh.used ?? null;
+    a.five_hour_cap = fh.cap ?? null;
+    a.five_hour_exceeded = fh.exceeded ? 1 : 0;
+    a.five_hour_reset = fh.resetAt ?? 0;
+    a.weekly_used = wk.used ?? null;
+    a.weekly_cap = wk.cap ?? null;
+    a.weekly_exceeded = wk.exceeded ? 1 : 0;
+    a.weekly_reset = wk.resetAt ?? 0;
+    a.detail = buildDetail(report);
+    a.last_error = '';
+    return true;
+  }
+
   async seedIfEmpty() {
     return 0;
   }
@@ -1039,7 +1093,26 @@ async function handleAdmin(request, env, ctx, url) {
           const retryAfter = Number(res.headers.get('retry-after')) || 300;
           await pool.cooldown(a.id, retryAfter, 'rate_limited (429)');
         } else if (res.ok) {
-          await pool.markQuotaError(a.id, '');
+          try {
+            const report = await fetchAccountQuota(base, apiKey, {
+              signal: request.signal,
+              timeoutMs: getConfig(env).controlPlaneTimeoutMs,
+            });
+            if (report) await pool.saveQuota(a.id, report);
+          } catch (qe) {
+            if (request.signal.aborted || qe?.name === 'AbortError') throw qe;
+            if (qe?.status === 401) {
+              await pool.disable(a.id, 'key_invalid (401)');
+            } else if (qe?.status === 429) {
+              const retryAfter = Number(qe.retryAfter) || 300;
+              await pool.cooldown(a.id, retryAfter, 'rate_limited (429)');
+            } else {
+              await pool.markQuotaError(a.id, qe.message || String(qe));
+              console.warn(JSON.stringify({ message: 'quota fetch transient error', accountId: a.id, error: qe.message }));
+            }
+          }
+        } else {
+          await pool.markQuotaError(a.id, `upstream models HTTP ${res.status}`);
         }
         return (await pool.list()).find((x) => x.id === a.id) || a;
       } catch (e) {
