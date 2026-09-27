@@ -639,6 +639,99 @@ async function testWorkerE2E() {
   }
 }
 
+async function testClientAuth() {
+  console.log('--- testClientAuth ---');
+
+  // 1. 按文档配置 API_KEYS（复数）：正确 Key 放行，错误/缺失 401
+  const env = {
+    API_BASE: 'https://api.commandcode.ai',
+    API_KEYS: 'sk-test-1, sk-test-2',
+    ACCOUNTS: '[]',
+  };
+
+  const modelsOk = await worker.fetch(
+    new Request('https://gateway.test/v1/models', {
+      headers: { authorization: 'Bearer sk-test-1' },
+    }),
+    env,
+  );
+  assertEq(modelsOk.status, 200, 'auth: API_KEYS 配置后正确 Bearer 放行');
+
+  const modelsOkXApiKey = await worker.fetch(
+    new Request('https://gateway.test/v1/models', {
+      headers: { 'x-api-key': 'sk-test-2' },
+    }),
+    env,
+  );
+  assertEq(modelsOkXApiKey.status, 200, 'auth: x-api-key 头同样放行');
+
+  const modelsWrong = await worker.fetch(
+    new Request('https://gateway.test/v1/models', {
+      headers: { authorization: 'Bearer sk-wrong' },
+    }),
+    env,
+  );
+  assertEq(modelsWrong.status, 401, 'auth: 错误 Key 返回 401');
+
+  const modelsMissing = await worker.fetch(new Request('https://gateway.test/v1/models'), env);
+  assertEq(modelsMissing.status, 401, 'auth: 缺 Key 返回 401');
+
+  const chatWrong = await worker.fetch(
+    new Request('https://gateway.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer sk-wrong' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    }),
+    env,
+  );
+  assertEq(chatWrong.status, 401, 'auth: 生成端点错误 Key 返回 401');
+
+  // 2. 未配置 API_KEYS 且未放开匿名：503 auth_not_configured（README 承诺的行为）
+  const noAuthEnv = { API_BASE: 'https://api.commandcode.ai', ACCOUNTS: '[]' };
+  const modelsNoAuth = await worker.fetch(
+    new Request('https://gateway.test/v1/models', {
+      headers: { authorization: 'Bearer whatever' },
+    }),
+    noAuthEnv,
+  );
+  assertEq(modelsNoAuth.status, 503, 'auth: 未配置 API_KEYS 时 /v1/models 返回 503');
+  const noAuthBody = await modelsNoAuth.json();
+  assertEq(noAuthBody.error.code, 'auth_not_configured', 'auth: 503 携带 auth_not_configured');
+
+  const chatNoAuth = await worker.fetch(
+    new Request('https://gateway.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    }),
+    noAuthEnv,
+  );
+  assertEq(chatNoAuth.status, 503, 'auth: 未配置 API_KEYS 时生成端点返回 503');
+
+  // 3. 仅放开匿名：放行
+  const anonEnv = { API_BASE: 'https://api.commandcode.ai', ALLOW_ANONYMOUS: 'true', ACCOUNTS: '[]' };
+  const modelsAnon = await worker.fetch(new Request('https://gateway.test/v1/models'), anonEnv);
+  assertEq(modelsAnon.status, 200, 'auth: ALLOW_ANONYMOUS=true 放行匿名');
+
+  // 4. 管理面：ADMIN_TOKEN 校验 + 未配置时 503
+  const adminEnv = {
+    API_BASE: 'https://api.commandcode.ai',
+    ADMIN_TOKEN: 'admintok',
+    ACCOUNTS: '[]',
+  };
+  const stateNoToken = await worker.fetch(new Request('https://gateway.test/api/state'), adminEnv);
+  assertEq(stateNoToken.status, 401, 'auth: 管理接口缺令牌返回 401');
+  const stateOk = await worker.fetch(
+    new Request('https://gateway.test/api/state', { headers: { 'x-admin-token': 'admintok' } }),
+    adminEnv,
+  );
+  assertEq(stateOk.status, 200, 'auth: 管理接口正确令牌放行');
+
+  const noAdminEnv = { API_BASE: 'https://api.commandcode.ai', ACCOUNTS: '[]' };
+  const stateNoAdmin = await worker.fetch(new Request('https://gateway.test/api/state'), noAdminEnv);
+  assertEq(stateNoAdmin.status, 503, 'auth: 未配置 ADMIN_TOKEN 时管理接口返回 503');
+}
+
 async function testAdminAndPool() {
   console.log('--- testAdminAndPool ---');
   const mock = installProviderMock({
@@ -943,6 +1036,7 @@ async function runAll() {
   await testSingleAccountRunner();
   await testStreamObserver();
   await testWorkerE2E();
+  await testClientAuth();
   await testAdminAndPool();
   await testD1E2E();
   await testQuotaClientAndStorage();

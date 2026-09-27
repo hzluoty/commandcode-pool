@@ -112,7 +112,7 @@ function getConfig(env = {}) {
   return {
     apiBase: env.API_BASE || DEFAULT_BASE,
     adminToken: env.ADMIN_TOKEN || '',
-    apiKeys: env.API_KEY || '',
+    apiKeys: env.API_KEYS || '',
     allowAnonymous: env.ALLOW_ANONYMOUS === 'true' || env.ALLOW_ANONYMOUS === '1',
     tzOffset: Number.isFinite(Number(env.TIMEZONE_OFFSET)) ? Number(env.TIMEZONE_OFFSET) : DEFAULT_TZ_OFFSET,
     controlPlaneTimeoutMs: DEFAULT_CONTROL_PLANE_TIMEOUT_MS,
@@ -124,7 +124,7 @@ function getConfig(env = {}) {
 }
 
 function configuredClientKeys(env) {
-  const raw = env.API_KEY || '';
+  const raw = env.API_KEYS || '';
   return raw.split(',').map((k) => k.trim()).filter(Boolean);
 }
 
