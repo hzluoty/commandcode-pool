@@ -23,6 +23,7 @@ const MAX_USAGE_RETENTION_SECONDS = 30 * 86400; // 最多保留 30 天分桶
 
 const JSON_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8',
+  'Cache-Control': 'no-store',
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, x-admin-token, x-cmd-zdr',

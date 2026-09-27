@@ -330,7 +330,7 @@
   var token = '', server = '';
   var curTab = 'quota';
   var accounts = [], poolState = null;
-  var dailyData = null, dailyRange = '1d';
+  var dailyData = null, dailyRange = '1d', dailyLoading = false, usageTimer = null;
   var expandedAcc = new Set(), expandedDay = new Set();
   var autoTimer = null, loading = false;
 
@@ -363,7 +363,13 @@
     $('tabbtn-usage').className = name === 'usage' ? 'active' : '';
     $('tab-quota').style.display = name === 'quota' ? '' : 'none';
     $('tab-usage').style.display = name === 'usage' ? '' : 'none';
-    if (name === 'usage') loadDaily();
+    // The usage tab shows a rolling window (e.g. 最近 5 分钟); keep it ticking
+    // while visible so buckets age out and new traffic appears on its own.
+    if (usageTimer) { clearInterval(usageTimer); usageTimer = null; }
+    if (name === 'usage') {
+      loadDaily();
+      usageTimer = setInterval(loadDaily, 10000);
+    }
   }
   function appError(msg) {
     var el = $('app-err');
@@ -456,12 +462,16 @@
     } finally { loading = false; }
   }
   async function loadDaily() {
+    if (dailyLoading) return;
+    dailyLoading = true;
     try {
       dailyData = await api('/api/usage/daily?range=' + dailyRange);
       appError('');
       renderUsage();
     } catch (e) {
       if (e.message !== '需要登录') appError(e.message);
+    } finally {
+      dailyLoading = false;
     }
   }
 
@@ -687,7 +697,6 @@
     if (this.checked) {
       autoTimer = setInterval(function () {
         loadQuota();
-        if (curTab === 'usage') loadDaily();
       }, 30000);
     }
   });

@@ -45,6 +45,33 @@ function assertEq(actual, expected, name) {
   assert(ok, name, ok ? undefined : { actual, expected });
 }
 
+// In-memory D1 stand-in backed by node:sqlite (same shape as D1Pool expects)
+function makeMockD1(DatabaseSync) {
+  return new (class MockD1 {
+    constructor() {
+      this.db = new DatabaseSync(':memory:');
+    }
+    prepare(sql) {
+      const self = this;
+      const stmt = { sql, params: [] };
+      stmt.bind = (...p) => {
+        stmt.params = p;
+        return stmt;
+      };
+      stmt.first = async () => self.db.prepare(sql).get(...stmt.params) ?? null;
+      stmt.run = async () => {
+        const info = self.db.prepare(sql).run(...stmt.params);
+        return { meta: { last_row_id: Number(info.lastInsertRowid ?? 0), changes: info.changes } };
+      };
+      stmt.all = async () => ({ results: self.db.prepare(sql).all(...stmt.params) });
+      return stmt;
+    }
+    async batch(stmts) {
+      for (const s of stmts) await s.run();
+    }
+  })();
+}
+
 const enc = new TextEncoder();
 
 function sseResponse(events, status = 200, headers = {}) {
@@ -855,30 +882,6 @@ async function testD1E2E() {
     return;
   }
 
-  class MockD1 {
-    constructor() {
-      this.db = new DatabaseSync(':memory:');
-    }
-    prepare(sql) {
-      const self = this;
-      const stmt = { sql, params: [] };
-      stmt.bind = (...p) => {
-        stmt.params = p;
-        return stmt;
-      };
-      stmt.first = async () => self.db.prepare(sql).get(...stmt.params) ?? null;
-      stmt.run = async () => {
-        const info = self.db.prepare(sql).run(...stmt.params);
-        return { meta: { last_row_id: Number(info.lastInsertRowid ?? 0), changes: info.changes } };
-      };
-      stmt.all = async () => ({ results: self.db.prepare(sql).all(...stmt.params) });
-      return stmt;
-    }
-    async batch(stmts) {
-      for (const s of stmts) await s.run();
-    }
-  }
-
   const mock = installProviderMock({
     behavior: {
       'd1-key-limited': 'limited',
@@ -887,7 +890,7 @@ async function testD1E2E() {
   });
 
   try {
-    const db = new MockD1();
+    const db = makeMockD1(DatabaseSync);
     const env = {
       API_BASE: 'https://api.commandcode.ai',
       DB: db,
@@ -1092,6 +1095,38 @@ async function testUsageReporting() {
   assertEq(bucket.accounts.length, 1, 'usage: bucket carries per-account breakdown');
   assertEq(bucket.accounts[0].label, 'UsageKey', 'usage: per-account label resolved');
   assertEq(bucket.accounts[0].promptTokens, 10, 'usage: per-account prompt tokens');
+
+  // 3. D1 range filter: buckets older than the selected window must age out
+  let DatabaseSync;
+  try {
+    DatabaseSync = (await import('node:sqlite')).DatabaseSync;
+  } catch {
+    console.log('  node:sqlite not available, skipping D1 filter test');
+    return;
+  }
+  const d1pool = new D1Pool(makeMockD1(DatabaseSync));
+  const accId = await d1pool.add('filter-key', 'F');
+  const t0 = 1758972600000; // arbitrary fixed instant
+  const realNow = Date.now;
+  try {
+    Date.now = () => t0 - 15 * 60 * 1000;
+    await d1pool.recordSuccess(accId, { prompt_tokens: 1, completion_tokens: 1 });
+    Date.now = () => t0 - 10 * 60 * 1000;
+    await d1pool.recordSuccess(accId, { prompt_tokens: 2, completion_tokens: 1 });
+    Date.now = () => t0;
+    await d1pool.recordSuccess(accId, { prompt_tokens: 3, completion_tokens: 1 });
+
+    const fiveMin = await d1pool.dailyUsage('5m');
+    assertEq(fiveMin.totals.requests, 1, 'usage: 5m window excludes buckets older than 5 minutes');
+    assertEq(fiveMin.totals.promptTokens, 3, 'usage: 5m totals only count in-window tokens');
+    assertEq(fiveMin.timeline.length, 1, 'usage: 5m timeline has exactly the current bucket');
+
+    const oneDay = await d1pool.dailyUsage('1d');
+    assertEq(oneDay.totals.requests, 3, 'usage: 1d window keeps all recent buckets');
+    assertEq(oneDay.timeline.length, 3, 'usage: 1d timeline shows one bar per bucket');
+  } finally {
+    Date.now = realNow;
+  }
 }
 
 async function runAll() {
