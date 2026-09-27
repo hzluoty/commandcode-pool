@@ -183,11 +183,33 @@ function normalizeUsageRange(raw) {
   const s = String(raw || '').trim().toLowerCase();
   if (s === '5m' || s === '5min') return { key: '5m', label: '最近 5 分钟', seconds: 300, intervalSeconds: 300 };
   if (s === '1h') return { key: '1h', label: '最近 1 小时', seconds: 3600, intervalSeconds: 300 };
+  if (s === '5h') return { key: '5h', label: '最近 5 小时', seconds: 5 * 3600, intervalSeconds: 300 };
   if (s === '6h') return { key: '6h', label: '最近 6 小时', seconds: 6 * 3600, intervalSeconds: 300 };
   if (s === '24h' || s === '1d') return { key: '1d', label: '最近 24 小时', seconds: 86400, intervalSeconds: 300 };
+  if (s === '3d') return { key: '3d', label: '最近 3 天', seconds: 3 * 86400, intervalSeconds: 3600 };
   if (s === '7d') return { key: '7d', label: '最近 7 天', seconds: 7 * 86400, intervalSeconds: 3600 };
   if (s === '30d') return { key: '30d', label: '最近 30 天', seconds: 30 * 86400, intervalSeconds: 86400 };
   return { key: '1d', label: '最近 24 小时', seconds: 86400, intervalSeconds: 300 };
+}
+
+function usagePeriodLabel(periodStart, intervalSeconds, tzOffset = DEFAULT_TZ_OFFSET) {
+  const d = new Date((Number(periodStart) + tzOffset * 3600) * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  const date = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+  if (intervalSeconds >= 86400) return date;
+  if (intervalSeconds >= 3600) return `${date} ${pad(d.getUTCHours())}:00`;
+  return `${date} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
+function newBucketAccount(accId, labels) {
+  return {
+    id: accId,
+    label: labels[accId] || `Account #${accId}`,
+    requests: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    cacheReadTokens: 0,
+  };
 }
 
 function buildUsage(bucketRows, labels, info, tzOffset) {
@@ -197,16 +219,7 @@ function buildUsage(bucketRows, labels, info, tzOffset) {
 
   for (const row of bucketRows) {
     const accId = row.account_id;
-    if (!accounts[accId]) {
-      accounts[accId] = {
-        id: accId,
-        label: labels[accId] || `Account #${accId}`,
-        requests: 0,
-        promptTokens: 0,
-        completionTokens: 0,
-        cacheReadTokens: 0,
-      };
-    }
+    if (!accounts[accId]) accounts[accId] = newBucketAccount(accId, labels);
     const a = accounts[accId];
     a.requests += row.requests || 0;
     a.promptTokens += row.prompt_tokens || 0;
@@ -221,16 +234,40 @@ function buildUsage(bucketRows, labels, info, tzOffset) {
     const intervalStart = Math.floor(row.bucket_start / info.intervalSeconds) * info.intervalSeconds;
     let b = bucketsMap.get(intervalStart);
     if (!b) {
-      b = { timestamp: intervalStart, requests: 0, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0 };
+      b = {
+        timestamp: intervalStart,
+        day: usagePeriodLabel(intervalStart, info.intervalSeconds, tzOffset),
+        requests: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        cacheReadTokens: 0,
+        accountMap: new Map(),
+      };
       bucketsMap.set(intervalStart, b);
     }
     b.requests += row.requests || 0;
     b.promptTokens += row.prompt_tokens || 0;
     b.completionTokens += row.completion_tokens || 0;
     b.cacheReadTokens += row.cache_read_tokens || 0;
+
+    let ba = b.accountMap.get(accId);
+    if (!ba) {
+      ba = newBucketAccount(accId, labels);
+      b.accountMap.set(accId, ba);
+    }
+    ba.requests += row.requests || 0;
+    ba.promptTokens += row.prompt_tokens || 0;
+    ba.completionTokens += row.completion_tokens || 0;
+    ba.cacheReadTokens += row.cache_read_tokens || 0;
   }
 
-  const timeline = Array.from(bucketsMap.values()).sort((a, b) => a.timestamp - b.timestamp);
+  const timeline = Array.from(bucketsMap.values())
+    .map((b) => {
+      const { accountMap, ...row } = b;
+      row.accounts = Array.from(accountMap.values()).sort((x, y) => x.id - y.id);
+      return row;
+    })
+    .sort((a, b) => a.timestamp - b.timestamp);
   return {
     totals,
     accounts: Object.values(accounts),

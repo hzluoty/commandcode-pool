@@ -59,7 +59,7 @@ curl -X POST https://<worker>/api/refresh -H "x-admin-token: $ADMIN_TOKEN" -d '{
 # 号池概览（当前活跃账号、总用量、分桶统计）
 curl https://<worker>/api/state -H "x-admin-token: $ADMIN_TOKEN"
 
-# 用量统计（5m/1h/6h/1d/7d/30d）
+# 用量统计（5m/1h/5h/6h/1d/3d/7d/30d）
 curl 'https://<worker>/api/usage/daily?range=1d' -H "x-admin-token: $ADMIN_TOKEN"
 
 # 启用/禁用、删除

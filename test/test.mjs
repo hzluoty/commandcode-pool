@@ -317,6 +317,24 @@ async function testApiAdapters() {
     threw = e instanceof ClientInputError && e.status === 400;
   }
   assert(threw, 'adapter: missing input in responses throws 400 ClientInputError');
+
+  // 5. Chat stream asks the upstream for a usage chunk (otherwise the usage
+  //    dashboard records zeros for streamed completions)
+  const chatStream = prepareGenerationRequest('chat', {
+    messages: [{ role: 'user', content: 'hello' }],
+    stream: true,
+  });
+  assertEq(chatStream.body.stream_options.include_usage, true, 'adapter: chat stream requests usage chunk');
+  const chatNoStream = prepareGenerationRequest('chat', {
+    messages: [{ role: 'user', content: 'hello' }],
+  });
+  assertEq(chatNoStream.body.stream_options, undefined, 'adapter: non-stream chat leaves stream_options untouched');
+  const chatOptOut = prepareGenerationRequest('chat', {
+    messages: [{ role: 'user', content: 'hello' }],
+    stream: true,
+    stream_options: { include_usage: false },
+  });
+  assertEq(chatOptOut.body.stream_options.include_usage, false, 'adapter: explicit include_usage=false is honored');
 }
 
 async function testUpstreamClient() {
@@ -541,6 +559,23 @@ async function testStreamObserver() {
 
     const outcome = await outcomePromise;
     assertEq(outcome.status, 'incomplete', 'sse: cut off stream registers incomplete');
+  }
+
+  // Test 4: cumulative usage across events (Anthropic message_start + message_delta)
+  {
+    const { transformStream, outcomePromise } = createSseObserverTransform({ policy });
+    const drainPromise = drain(transformStream.readable);
+    const writer = transformStream.writable.getWriter();
+    await writer.write(enc.encode('event: message_start\ndata: {"type":"message_start","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":1}}}\n\n'));
+    await writer.write(enc.encode('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n'));
+    await writer.write(enc.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'));
+    await writer.close();
+    await drainPromise;
+
+    const outcome = await outcomePromise;
+    assertEq(outcome.status, 'success', 'sse: anthropic-style stream registers success');
+    assertEq(outcome.usage.prompt_tokens, 10, 'sse: cumulative merge keeps input tokens from message_start');
+    assertEq(outcome.usage.completion_tokens, 5, 'sse: cumulative merge keeps latest output total');
   }
 }
 
@@ -1028,6 +1063,37 @@ async function testAdminRefreshAndQuotaIntegration() {
   }
 }
 
+async function testUsageReporting() {
+  console.log('--- testUsageReporting ---');
+
+  // 1. Range keys match the admin UI buttons (5h / 3d must not fall back to 1d)
+  assertEq(normalizeUsageRange('5h').key, '5h', 'usage: 5h range supported');
+  assertEq(normalizeUsageRange('5h').seconds, 5 * 3600, 'usage: 5h seconds');
+  assertEq(normalizeUsageRange('3d').key, '3d', 'usage: 3d range supported');
+  assertEq(normalizeUsageRange('3d').seconds, 3 * 86400, 'usage: 3d seconds');
+  assertEq(normalizeUsageRange('24h').key, '1d', 'usage: 24h aliases 1d');
+
+  // 2. buildUsage shape: timeline rows carry a day label and per-bucket accounts
+  const pool = new MemPool([{ key: 'usage-key', label: 'UsageKey' }]);
+  await pool.recordSuccess(1, {
+    prompt_tokens: 10,
+    completion_tokens: 5,
+    prompt_tokens_details: { cached_tokens: 4 },
+  });
+  const usage = await pool.dailyUsage('5m');
+  assertEq(usage.totals.requests, 1, 'usage: totals count the request');
+  assertEq(usage.totals.promptTokens, 10, 'usage: totals sum prompt tokens');
+  assertEq(usage.totals.completionTokens, 5, 'usage: totals sum completion tokens');
+  assertEq(usage.totals.cacheReadTokens, 4, 'usage: totals sum cache-read tokens');
+  assert(usage.timeline.length >= 1, 'usage: timeline has buckets');
+  const bucket = usage.timeline[usage.timeline.length - 1];
+  assert(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(bucket.day), 'usage: bucket has formatted day label', bucket.day);
+  assertEq(bucket.promptTokens, 10, 'usage: bucket aggregates prompt tokens');
+  assertEq(bucket.accounts.length, 1, 'usage: bucket carries per-account breakdown');
+  assertEq(bucket.accounts[0].label, 'UsageKey', 'usage: per-account label resolved');
+  assertEq(bucket.accounts[0].promptTokens, 10, 'usage: per-account prompt tokens');
+}
+
 async function runAll() {
   console.log('=== Running commandcode-pool Test Suite ===\n');
   await testApiAdapters();
@@ -1035,6 +1101,7 @@ async function runAll() {
   await testFailurePolicy();
   await testSingleAccountRunner();
   await testStreamObserver();
+  await testUsageReporting();
   await testWorkerE2E();
   await testClientAuth();
   await testAdminAndPool();

@@ -592,7 +592,7 @@
   // ---------- Tab：用量统计 ----------
   function renderUsage() {
     if (!dailyData) return;
-    var rows = dailyData.daily || [];
+    var rows = dailyData.timeline || dailyData.daily || [];
     var t = dailyData.totals || {};
     var hit = Number(t.promptTokens || 0) > 0 ? Math.round(Number(t.cacheReadTokens || 0) / Number(t.promptTokens) * 100) : null;
     var tz = Number(dailyData.tzOffset || 0);
