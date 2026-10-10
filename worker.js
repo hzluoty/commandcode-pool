@@ -4,7 +4,7 @@
 // No prompt replay, no CLI emulation, no synthetic device fingerprints.
 
 import { prepareGenerationRequest } from './lib/api-adapters.js';
-import { createProviderFailurePolicy, ClientInputError } from './lib/failure-policy.js';
+import { createProviderFailurePolicy, clientErrorBody, ClientInputError } from './lib/failure-policy.js';
 import { runSingleAccountGeneration } from './lib/generation-runner.js';
 import { sendGeneration } from './lib/upstream-client.js';
 import { selectSingleAccount, unavailableAccountResponse, persistAccountHealth } from './lib/pool-store.js';
@@ -20,6 +20,12 @@ const D1_MIGRATION_BATCH_ROWS = 200;
 const D1_MIGRATION_WAIT_MS = 250;
 const USAGE_BUCKET_SECONDS = 300; // 5 分钟分桶
 const MAX_USAGE_RETENTION_SECONDS = 30 * 86400; // 最多保留 30 天分桶
+// Provider 模型目录缓存。上游同样缓存 5 分钟：目录与账号无关，一次成功抓取
+// 足以服务后续请求，避免每个 /v1/models 都拿账号 Key 打一次控制面接口。
+const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
+// 入站体积上限。上游默认 100MB 是按 Node 进程 GB 级内存定的；Worker 只有 128MB
+// 内存，且解析后的请求树约为原文的 5~7 倍，故默认收紧到 32MB（MAX_BODY_MB 可调）。
+const DEFAULT_MAX_BODY_MB = 32;
 
 const JSON_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8',
@@ -92,6 +98,18 @@ function errorResponse(status, type, message, code = null, headers = {}) {
   );
 }
 
+/**
+ * Gateway-level failure on a generation surface. The body follows the client's
+ * own protocol (OpenAI envelope, or `{"type":"error",...}` on /v1/messages)
+ * even when the failure happens before the upstream is contacted.
+ */
+function surfaceError(kind, status, type, message, code = null) {
+  return json(
+    clientErrorBody(kind, { body: { error: { message, type, ...(code ? { code } : {}) } } }),
+    status,
+  );
+}
+
 async function readBody(request) {
   const type = request.headers.get('content-type') || '';
   if (type.includes('application/json')) {
@@ -120,6 +138,9 @@ function getConfig(env = {}) {
     defaultModel: env.DEFAULT_MODEL || 'deepseek/deepseek-v4-flash',
     messagesDefaultModel: env.MESSAGES_DEFAULT_MODEL || 'claude-sonnet-4-6',
     defaultMaxTokens: Number.isFinite(Number(env.DEFAULT_MAX_TOKENS)) ? Number(env.DEFAULT_MAX_TOKENS) : 4096,
+    maxBodyMb: Number.isFinite(Number(env.MAX_BODY_MB)) && Number(env.MAX_BODY_MB) > 0
+      ? Number(env.MAX_BODY_MB)
+      : DEFAULT_MAX_BODY_MB,
     selectionStrategy: selectionStrategy(env),
   };
 }
@@ -298,21 +319,29 @@ async function fetchModels(base, apiKey, signal, timeoutMs = DEFAULT_CONTROL_PLA
   }, { signal, timeoutMs });
 }
 
-async function getModels(env, base, signal) {
+let modelCatalogCache = { at: 0, data: null };
+
+async function getModels(env, base, signal, now = Date.now()) {
   const pool = getPool(env);
-  const key = await pool.anyKey();
   const fallback = [
     { id: 'deepseek/deepseek-v4-flash', object: 'model' },
     { id: 'deepseek/deepseek-v4-pro', object: 'model' },
     { id: 'claude-sonnet-4-6', object: 'model' },
     { id: 'gpt-5.5', object: 'model' },
   ];
+  if (modelCatalogCache.data && now - modelCatalogCache.at < MODEL_CATALOG_TTL_MS) {
+    return modelCatalogCache.data;
+  }
+  const key = await pool.anyKey();
   if (!key) return fallback;
   try {
     const res = await fetchModels(base, key, signal);
     if (!res.ok) return fallback;
     const data = await res.json();
-    return Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : fallback);
+    const list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : null);
+    if (!list) return fallback;
+    modelCatalogCache = { at: now, data: list };
+    return list;
   } catch {
     return fallback;
   }
@@ -1186,17 +1215,43 @@ async function handleAdmin(request, env, ctx, url) {
 
 // ============================ §G 生成调用 ============================
 
+// Test/manual hook for the 5-minute /v1/models cache.
+function resetModelCatalog() {
+  modelCatalogCache = { at: 0, data: null };
+}
+
 async function handleGenerate(request, env, ctx, kind) {
   const cfg = getConfig(env);
   const pool = getPool(env);
   const requestId = crypto.randomUUID();
-  const url = new URL(request.url);
+
+  // Reject oversized bodies before the JSON tree is built: a Worker isolate has
+  // 128MB total, and the parsed request costs several times the wire size.
+  const maxBodyBytes = cfg.maxBodyMb * 1024 * 1024;
+  const declaredBytes = Number(request.headers.get('content-length') || 0);
+  if (declaredBytes > maxBodyBytes) {
+    // Drop the inbound stream before answering: workerd resets the connection
+    // (and the client sees "network connection lost") if a response is sent
+    // while a request body is still being uploaded.
+    try {
+      await request.body?.cancel();
+    } catch {
+      /* nothing to drain */
+    }
+    return surfaceError(kind, 413, 'invalid_request_error', `Request body exceeds ${cfg.maxBodyMb}MB limit`, 'request_too_large');
+  }
 
   let body;
   try {
-    body = await request.json();
+    // Measured in UTF-16 units: never more characters than bytes, so the budget
+    // can only be loose for multi-byte text and never under-counts nodes.
+    const raw = await request.text();
+    if (raw.length > maxBodyBytes) {
+      return surfaceError(kind, 413, 'invalid_request_error', `Request body exceeds ${cfg.maxBodyMb}MB limit`, 'request_too_large');
+    }
+    body = JSON.parse(raw);
   } catch (e) {
-    return errorResponse(400, 'invalid_request_error', 'Invalid JSON body: ' + (e?.message || 'parse error'));
+    return surfaceError(kind, 400, 'invalid_request_error', 'Invalid JSON body: ' + (e?.message || 'parse error'));
   }
 
   let prepared;
@@ -1210,7 +1265,7 @@ async function handleGenerate(request, env, ctx, kind) {
   } catch (error) {
     const status = error.status || 400;
     const code = error.code || 'invalid_request_error';
-    return errorResponse(status, 'invalid_request_error', error.message, code);
+    return surfaceError(kind, status, 'invalid_request_error', error.message, code);
   }
 
   const policy = createProviderFailurePolicy();
@@ -1237,7 +1292,7 @@ async function handleGenerate(request, env, ctx, kind) {
       const headers = new Headers();
       headers.set('content-type', 'application/json; charset=utf-8');
       if (mapped.retryAfter) headers.set('retry-after', String(mapped.retryAfter));
-      return new Response(JSON.stringify(mapped.body), { status: mapped.status, headers });
+      return new Response(JSON.stringify(clientErrorBody(k, mapped)), { status: mapped.status, headers });
     },
   });
 }
@@ -1288,18 +1343,18 @@ export default {
 
     if (isChat || isMessages || isResponses) {
       if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405);
-      if (!clientAuthConfigured(env) && !isAnonymousAllowed(env)) {
-        return errorResponse(503, 'server_error', 'client authentication is not configured', 'auth_not_configured');
-      }
-      if (!(await checkClientAuth(request, env))) return errorResponse(401, 'authentication_error', 'invalid api key');
-      if (needsPool && env.DB && env.ACCOUNTS) await getPool(env).seedIfEmpty(parseAccountsEnv(env.ACCOUNTS));
       const kind = isChat ? 'chat' : (isMessages ? 'messages' : 'responses');
+      if (!clientAuthConfigured(env) && !isAnonymousAllowed(env)) {
+        return surfaceError(kind, 503, 'server_error', 'client authentication is not configured', 'auth_not_configured');
+      }
+      if (!(await checkClientAuth(request, env))) return surfaceError(kind, 401, 'authentication_error', 'invalid api key');
+      if (needsPool && env.DB && env.ACCOUNTS) await getPool(env).seedIfEmpty(parseAccountsEnv(env.ACCOUNTS));
       try {
         return await handleGenerate(request, env, ctx, kind);
       } catch (e) {
         if (request.signal.aborted || e?.name === 'AbortError') throw e;
         console.error(JSON.stringify({ message: 'generate request failed', error: e instanceof Error ? e.message : String(e), kind }));
-        return errorResponse(500, 'server_error', 'internal server error', 'internal_error');
+        return surfaceError(kind, 500, 'server_error', 'internal server error', 'internal_error');
       }
     }
 
@@ -1373,6 +1428,8 @@ export {
   safeEqual,
   rowToAccount,
   handleGenerate,
+  getModels,
+  resetModelCatalog,
   buildPoolState,
   normalizeUsageRange,
   usageBucketStart,

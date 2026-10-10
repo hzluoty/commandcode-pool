@@ -1,0 +1,45 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 是 wrangler 4 / node:sqlite 的下限，24 与本地开发一致。
+        # 测试自带 Provider mock，不需要网络与 wrangler 依赖。
+        node: ['22', '24']
+    name: node ${{ matrix.node }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Show Node version
+        run: node --version
+
+      - name: Syntax check
+        run: |
+          node --check worker.js
+          for f in lib/*.js; do node --check "$f"; done
+
+      - name: Run tests
+        run: npm test

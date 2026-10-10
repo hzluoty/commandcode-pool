@@ -14,13 +14,15 @@ import worker, {
   safeEqual,
   rowToAccount,
   handleGenerate,
+  getModels,
+  resetModelCatalog,
   buildPoolState,
   normalizeUsageRange,
   usageBucketStart,
 } from '../worker.js';
 
 import { prepareGenerationRequest } from '../lib/api-adapters.js';
-import { createProviderFailurePolicy, ClientInputError } from '../lib/failure-policy.js';
+import { createProviderFailurePolicy, clientErrorBody, streamErrorFrame, ClientInputError } from '../lib/failure-policy.js';
 import { sendGeneration, providerUrl, PROVIDER_GENERATION_PATHS } from '../lib/upstream-client.js';
 import { runSingleAccountGeneration, createSseObserverTransform } from '../lib/generation-runner.js';
 import { selectSingleAccount, persistAccountHealth, unavailableAccountResponse } from '../lib/pool-store.js';
@@ -194,6 +196,16 @@ function installProviderMock({ behavior = {} } = {}) {
           { status: 200, headers: { 'content-type': 'text/event-stream' } },
         );
       }
+      if (b === 'empty') {
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        );
+      }
 
       const body = opts.body ? JSON.parse(opts.body) : {};
       const stream = body.stream === true;
@@ -362,6 +374,36 @@ async function testApiAdapters() {
     stream_options: { include_usage: false },
   });
   assertEq(chatOptOut.body.stream_options.include_usage, false, 'adapter: explicit include_usage=false is honored');
+
+  // 6. tool_choice: none 关闭工具（上游 tool_choice 枚举只有 auto/any/tool，
+  //    tools + none 透传会被 400 拒；语义上等价于本轮不要工具）
+  const tools = [{ type: 'function', function: { name: 'run', parameters: { type: 'object' } } }];
+  const chatNone = prepareGenerationRequest('chat', {
+    messages: [{ role: 'user', content: 'hello' }],
+    tools,
+    tool_choice: 'none',
+  });
+  assertEq(chatNone.body.tools, undefined, 'adapter: tool_choice none drops tools');
+  assertEq(chatNone.body.tool_choice, undefined, 'adapter: tool_choice none drops tool_choice');
+
+  const msgNone = prepareGenerationRequest('messages', {
+    messages: [{ role: 'user', content: 'hello' }],
+    tools: [{ name: 'run', input_schema: { type: 'object' } }],
+    tool_choice: { type: 'none' },
+  });
+  assertEq(msgNone.body.tools, undefined, 'adapter: messages tool_choice none drops tools');
+  assertEq(msgNone.body.tool_choice, undefined, 'adapter: messages tool_choice none drops tool_choice');
+
+  const respNone = prepareGenerationRequest('responses', { input: 'hi', tools, tool_choice: 'none' });
+  assertEq(respNone.body.tools, undefined, 'adapter: responses tool_choice none drops tools');
+
+  const chatAuto = prepareGenerationRequest('chat', {
+    messages: [{ role: 'user', content: 'hello' }],
+    tools,
+    tool_choice: 'auto',
+  });
+  assertEq(chatAuto.body.tools?.length, 1, 'adapter: other tool_choice keeps tools');
+  assertEq(chatAuto.body.tool_choice, 'auto', 'adapter: other tool_choice is untouched');
 }
 
 async function testUpstreamClient() {
@@ -449,6 +491,25 @@ async function testFailurePolicy() {
   const fInc = policy.incomplete('stream closed');
   assertEq(fInc.kind, 'operational', 'policy: incomplete is operational');
   assertEq(fInc.persistHealth, false, 'policy: incomplete does not persist health');
+
+  // Client-visible envelope must follow the surface the client speaks
+  // (https://commandcode.ai/docs/provider#errors)
+  const openaiShape = clientErrorBody('chat', f429.mapped);
+  assertEq(openaiShape.error.type, 'rate_limit_error', 'policy: OpenAI clients get the OpenAI envelope');
+  assertEq(openaiShape.retry_after, 120, 'policy: OpenAI envelope carries retry_after');
+
+  const anthropicShape = clientErrorBody('messages', f429.mapped);
+  assertEq(anthropicShape.type, 'error', 'policy: Anthropic clients get type=error');
+  assertEq(anthropicShape.error.type, 'rate_limit_error', 'policy: Anthropic envelope type is mapped');
+
+  const anthropic500 = clientErrorBody('messages', f500.mapped);
+  assertEq(anthropic500.error.type, 'api_error', 'policy: 5xx reports api_error to Anthropic clients');
+  assertEq(anthropic500.error.message, f500.mapped.body.error.message, 'policy: Anthropic envelope keeps the message');
+
+  // Terminal frames carry a status code that can no longer be sent
+  assertEq(streamErrorFrame('chat', fInc).startsWith('data: {"error"'), true, 'policy: chat stream error frame is an OpenAI error chunk');
+  assertEq(streamErrorFrame('messages', fInc).startsWith('event: error'), true, 'policy: messages stream error frame is an error event');
+  assertEq(streamErrorFrame('responses', fInc).startsWith('event: response.failed'), true, 'policy: responses stream error frame is response.failed');
 }
 
 async function testSingleAccountRunner() {
@@ -505,6 +566,12 @@ async function testSingleAccountRunner() {
       body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi 2' }] }),
     });
 
+    const prepared2 = {
+      path: '/provider/v1/chat/completions',
+      body: { model: 'm', messages: [{ role: 'user', content: 'hi 2' }] },
+      protocol: 'chat',
+    };
+
     const res2 = await runSingleAccountGeneration({
       request: req2,
       ctx: { waitUntil() {} },
@@ -512,11 +579,7 @@ async function testSingleAccountRunner() {
       cfg: { apiBase: 'https://api.commandcode.ai' },
       pool,
       strategy: 'sticky',
-      prepared: {
-        path: '/provider/v1/chat/completions',
-        body: { model: 'm', messages: [{ role: 'user', content: 'hi 2' }] },
-        protocol: 'chat',
-      },
+      prepared: prepared2,
       requestId: 'req-2',
       sendGeneration,
       readErrorText: async (r) => r.text(),
@@ -527,6 +590,8 @@ async function testSingleAccountRunner() {
     assertEq(res2.status, 200, 'runner: next independent request succeeds');
     assertEq(mock.calls.length, 1, 'runner: next request makes exactly one call');
     assertEq(mock.calls[0].apiKey, 'acc-ok', 'runner: called acc-ok');
+    // 请求体内存不跨流周期驻留（commandcode-proxy 40b338e #31 的同一意图）
+    assertEq(prepared2.body, null, 'runner: releases the serialized request body after the fetch');
   } finally {
     mock.restore();
   }
@@ -543,6 +608,18 @@ async function testStreamObserver() {
       const { done } = await reader.read();
       if (done) break;
     }
+  }
+
+  async function collect(readable) {
+    const reader = readable.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    return text;
   }
 
   // Test 1: Normal SSE with [DONE]
@@ -603,6 +680,65 @@ async function testStreamObserver() {
     assertEq(outcome.status, 'success', 'sse: anthropic-style stream registers success');
     assertEq(outcome.usage.prompt_tokens, 10, 'sse: cumulative merge keeps input tokens from message_start');
     assertEq(outcome.usage.completion_tokens, 5, 'sse: cumulative merge keeps latest output total');
+  }
+
+  // Test 5: 零字节流（上游 200 + 立即结束，一个帧都没有）不能以空响应收场：
+  // 状态码已提交，只能按各协议的错误帧告诉客户端流没成功
+  for (const [protocol, needle] of [
+    ['chat', 'data: {"error"'],
+    ['messages', 'event: error'],
+    ['responses', 'event: response.failed'],
+  ]) {
+    const { transformStream, outcomePromise } = createSseObserverTransform({ policy, protocol, log: { warn() {} } });
+    const collectPromise = collect(transformStream.readable);
+    const writer = transformStream.writable.getWriter();
+    await writer.close();
+    const text = await collectPromise;
+    const outcome = await outcomePromise;
+    assert(text.includes(needle), `sse: zero-byte ${protocol} stream emits its own error frame`);
+    assertEq(outcome.status, 'incomplete', `sse: zero-byte ${protocol} stream is not a success`);
+  }
+
+  // Test 6: 正常流的字节必须逐字不改（只有零字节的失败流才插帧）
+  {
+    const { transformStream, outcomePromise } = createSseObserverTransform({ policy, protocol: 'messages' });
+    const collectPromise = collect(transformStream.readable);
+    const writer = transformStream.writable.getWriter();
+    const frames = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ];
+    for (const f of frames) await writer.write(enc.encode(f));
+    await writer.close();
+    const text = await collectPromise;
+    const outcome = await outcomePromise;
+    assertEq(text, frames.join(''), 'sse: successful stream is relayed byte-for-byte');
+    assertEq(outcome.status, 'success', 'sse: successful stream registers success');
+  }
+
+  // Test 7: 上游的失败族 finish_reason 不得算作完成（commandcode-proxy a474cbc #61）
+  {
+    const { transformStream, outcomePromise } = createSseObserverTransform({ policy });
+    const drainPromise = drain(transformStream.readable);
+    const writer = transformStream.writable.getWriter();
+    await writer.write(enc.encode('data: {"choices":[{"delta":{},"finish_reason":"error"}]}\n\n'));
+    await writer.close();
+    await drainPromise;
+    const outcome = await outcomePromise;
+    assertEq(outcome.status, 'failure', 'sse: finish_reason=error is not a completed request');
+    assertEq(outcome.failure.persistHealth, false, 'sse: finish_reason=error does not damage account health');
+  }
+
+  // Test 8: 陌生但非失败族的 finish_reason 仍算结束（不当成截断）
+  {
+    const { transformStream, outcomePromise } = createSseObserverTransform({ policy });
+    const drainPromise = drain(transformStream.readable);
+    const writer = transformStream.writable.getWriter();
+    await writer.write(enc.encode('data: {"choices":[{"delta":{},"finish_reason":"other"}]}\n\n'));
+    await writer.close();
+    await drainPromise;
+    const outcome = await outcomePromise;
+    assertEq(outcome.status, 'success', 'sse: unknown non-failure finish_reason still ends the turn');
   }
 }
 
@@ -698,6 +834,132 @@ async function testWorkerE2E() {
     assert(abortThrew, 'worker: client abort cleanly propagates AbortError');
   } finally {
     mock.restore();
+  }
+}
+
+async function testUpstreamSync() {
+  console.log('--- testUpstreamSync (对齐 commandcode-proxy HEAD 972828a 的行为) ---');
+  const BASE = 'https://api.commandcode.ai';
+  const mock = installProviderMock({
+    behavior: { 'k-ok': 'ok', 'k-limited': 'limited', 'k-empty': 'empty', 'k-bad': 'badkey' },
+  });
+  const makeEnv = (key, extra = {}) => ({
+    API_BASE: BASE,
+    ALLOW_ANONYMOUS: 'true',
+    ACCOUNTS: `[{"key":"${key}","label":"sync"}]`,
+    ...extra,
+  });
+  const post = (path, body, env) => worker.fetch(
+    new Request(`https://gateway.test${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+    env,
+  );
+
+  try {
+    // 1. 模型目录 5 分钟缓存：后续 /v1/models 不再拿账号 Key 打控制面
+    resetModelCatalog();
+    const envModels = makeEnv('k-ok');
+    const modelCallsBefore = mock.calls.filter((c) => c.url.endsWith('/provider/v1/models')).length;
+    const first = await worker.fetch(new Request('https://gateway.test/v1/models'), envModels);
+    const second = await worker.fetch(new Request('https://gateway.test/v1/models'), envModels);
+    const modelCallsAfter = mock.calls.filter((c) => c.url.endsWith('/provider/v1/models')).length;
+    assertEq(first.status, 200, 'sync: /v1/models 200');
+    assertEq(modelCallsAfter - modelCallsBefore, 1, 'sync: model catalog fetched once, second call cached');
+    const firstJson = await first.json();
+    const secondJson = await second.json();
+    assertEq(secondJson.data?.[0]?.id, firstJson.data?.[0]?.id, 'sync: cached catalog serves the same list');
+
+    // 2. 错误封套按表面区分：Anthropic 客户端要 type=error（官方文档口径）
+    const msg401 = await post('/v1/messages', {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+    }, makeEnv('k-bad'));
+    assertEq(msg401.status, 401, 'sync: messages 401 passthrough status');
+    const msg401Body = await msg401.json();
+    assertEq(msg401Body.type, 'error', 'sync: messages error envelope uses type=error');
+    assertEq(msg401Body.error?.type, 'authentication_error', 'sync: messages error type mapped');
+    assertEq(typeof msg401Body.error?.message, 'string', 'sync: messages error keeps upstream message');
+
+    const chat429 = await post('/v1/chat/completions', {
+      model: 'deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'hi' }],
+    }, makeEnv('k-limited'));
+    assertEq(chat429.status, 429, 'sync: chat 429 passthrough status');
+    assertEq(chat429.headers.get('retry-after'), '3600', 'sync: chat 429 carries retry-after');
+    const chat429Body = await chat429.json();
+    assertEq(chat429Body.error?.type, 'rate_limit_error', 'sync: chat keeps the OpenAI envelope');
+    assertEq(chat429Body.error?.code, undefined, 'sync: OpenAI envelope omits an absent code');
+
+    // 3. tool_choice: none 不下发 tools/tool_choice（上游枚举无 none）
+    mock.calls.length = 0;
+    await post('/v1/chat/completions', {
+      model: 'deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'run', parameters: { type: 'object' } } }],
+      tool_choice: 'none',
+    }, makeEnv('k-ok'));
+    const sentBody = JSON.parse(mock.calls[0].body);
+    assertEq(sentBody.tools, undefined, 'sync: tool_choice none is not forwarded with tools');
+    assertEq(sentBody.tool_choice, undefined, 'sync: tool_choice none is not forwarded');
+
+    // 4. 零字节上游流不得以空 200 收场：状态码已提交，用本协议的错误帧说真话
+    const emptyChat = await post('/v1/chat/completions', {
+      model: 'deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    }, makeEnv('k-empty'));
+    const emptyChatText = await emptyChat.text();
+    assertEq(emptyChat.status, 200, 'sync: zero-byte stream keeps the committed 200');
+    assert(emptyChatText.includes('data: {"error"'), 'sync: zero-byte chat stream emits an error chunk');
+    assert(!emptyChatText.includes('[DONE]'), 'sync: zero-byte chat stream never claims a terminal');
+
+    const emptyMsg = await post('/v1/messages', {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    }, makeEnv('k-empty'));
+    const emptyMsgText = await emptyMsg.text();
+    assert(emptyMsgText.includes('event: error'), 'sync: zero-byte messages stream emits an error event');
+    assert(!emptyMsgText.includes('message_stop'), 'sync: zero-byte messages stream never claims message_stop');
+
+    // 6. 网关自身的失败也按客户端协议回（/v1/messages 是 Anthropic 表面）
+    const msgAuth = await worker.fetch(new Request('https://gateway.test/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer wrong-key' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }),
+    }), { API_BASE: BASE, API_KEYS: 'pool-key', ACCOUNTS: '[]' });
+    assertEq(msgAuth.status, 401, 'sync: gateway rejects a bad pool key with 401');
+    assertEq((await msgAuth.json()).type, 'error', 'sync: gateway 401 on /v1/messages uses the Anthropic envelope');
+
+    const msgBadJson = await worker.fetch(new Request('https://gateway.test/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{not json',
+    }), makeEnv('k-ok'));
+    assertEq(msgBadJson.status, 400, 'sync: malformed JSON is rejected with 400');
+    assertEq((await msgBadJson.json()).type, 'error', 'sync: malformed JSON on /v1/messages uses the Anthropic envelope');
+
+    const msgMissing = await post('/v1/messages', { model: 'claude-sonnet-4-6' }, makeEnv('k-ok'));
+    assertEq(msgMissing.status, 400, 'sync: missing messages is rejected with 400');
+    const msgMissingBody = await msgMissing.json();
+    assertEq(msgMissingBody.type, 'error', 'sync: adapter rejection on /v1/messages uses the Anthropic envelope');
+    assertEq(msgMissingBody.error?.type, 'invalid_request_error', 'sync: adapter rejection keeps the mapped type');
+
+    // 7. 超大请求体在解析前就被拒（Worker 只有 128MB 内存）
+    const cappedEnv = makeEnv('k-ok', { MAX_BODY_MB: '0.00001' });
+    const tooBig = await post('/v1/chat/completions', {
+      model: 'deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'hello' }],
+    }, cappedEnv);
+    assertEq(tooBig.status, 413, 'sync: oversized body is rejected with 413');
+    const tooBigBody = await tooBig.json();
+    assertEq(tooBigBody.error?.code, 'request_too_large', 'sync: 413 carries request_too_large');
+  } finally {
+    mock.restore();
+    resetModelCatalog();
   }
 }
 
@@ -1138,6 +1400,7 @@ async function runAll() {
   await testStreamObserver();
   await testUsageReporting();
   await testWorkerE2E();
+  await testUpstreamSync();
   await testClientAuth();
   await testAdminAndPool();
   await testD1E2E();

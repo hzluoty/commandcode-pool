@@ -16,6 +16,21 @@ Cloudflare Worker：把多个 Command Code 账号组成号池，对外提供 **O
 2. **严格单次调用，绝不跨账号重放**：一个逻辑请求只选择一个账号执行一次上游调用。若该账号返回 429、401 或网络超时，错误直接映射返回客户端并更新该账号健康状态，绝不拿客户端 prompt 重试其他账号（避免多账号因并发/重放被关联封禁）。
 3. **粘性调度（Cache 优先）**：默认策略为 **sticky**，优先复用最近活跃账号，保证提示词缓存（Prompt Cache）持续命中；当账号遇到 429 或 401 时进入冷却/禁用，后续独立请求自动切换到下一个可用账号。
 4. **单路径原生流式 Relay**：流式响应通过 `TransformStream` 直接向客户端透传字节，并在传输过程中就地解析终端状态与 Token 用量，杜绝内存无界缓冲与背压失真。客户端中断请求时，上游连接立刻同步终止。
+5. **按表面回错息封套**：`/v1/messages` 回 Anthropic 的 `{"type":"error",...}`，其余端点回 OpenAI 封套（官方 Provider API 文档口径）。
+
+## 协议一致性（对齐官方 Provider API 与上游 commandcode-proxy）
+
+| 行为 | 说明 |
+| --- | --- |
+| 原生透传 | 请求体与 Provider 原生 JSON/SSE 逐字透传，不做 envelope 转换 |
+| 错误封套 | OpenAI 封套（`/v1/chat/completions`、`/v1/responses`）与 Anthropic 封套（`/v1/messages`），含网关自身产生的 401/413/503 |
+| 零字节流 | 上游 200 后一个帧都没吐且流已结束：状态码已提交，改用本协议的错误帧（`data: {"error":…}` / `event: error` / `event: response.failed`）收尾，不让客户端把空响应当成功 |
+| `tool_choice: none` | 上游枚举只有 auto/any/tool：`none` 直接不下发 `tools` 与 `tool_choice`（语义等价，避开 400） |
+| 模型目录 | `/provider/v1/models` 5 分钟缓存，避免每次调用都拿账号 Key 打控制面 |
+| 请求体上限 | 超过 `MAX_BODY_MB`（默认 32MB）在解析前返回 `413 request_too_large`（Worker 只有 128MB 内存） |
+| 账号健康 | 只有 401（禁用）与 402/429（按 `Retry-After` 冷却）写入账号状态；403/4xx/5xx/流不完整不写，避免误伤可用账号 |
+
+与上游 `commandcode-proxy` 的逐项同步/差异记录见 [`docs/UPSTREAM-SYNC.md`](docs/UPSTREAM-SYNC.md)。
 
 ## 部署
 
@@ -97,6 +112,7 @@ curl https://<worker>/v1/chat/completions \
 | `ALLOW_ANONYMOUS` | 仅显式设为 `true` 时允许未配置鉴权，适合本地开发 |
 | `ACCOUNTS` | 未绑定 D1 时的内存号池（见上） |
 | `TIMEZONE_OFFSET` | `/api/usage/daily` 分桶时区（小时，默认 8） |
+| `MAX_BODY_MB` | 生成端点入站 body 上限（MB，默认 32）；超限返回 `413 request_too_large` |
 
 ## 端点一览
 
@@ -122,8 +138,14 @@ curl https://<worker>/v1/chat/completions \
 cp .dev.vars.example .dev.vars   # 指向本地 mock
 python3 mock_server.py 18090 &   # 离线 mock 上游
 npx wrangler dev                 # http://127.0.0.1:8787
-npm test                         # 运行单测与端到端测试
+npm test                         # 运行单测与端到端测试（Node 22+，无需网络）
 ```
+
+## 已知风险与运维提示
+
+- **管理端额度面板**（`POST /api/refresh`）会拿账号 Key 调用 `/alpha/whoami`、`/alpha/billing/*`、`/alpha/usage/summary` 等**未公开** CLI 接口。生成链路完全不碰这些端点，但刷新是手动触发的唯一入口：不需要额度展示就别点刷新。
+- **403 不改账号状态**：官方文档把 403 定义为 `upgrade_required`（计划级），不是密钥失效；若某账号长期 403，管理面板里禁用该账号即可。
+- **长时间思考的流不做空闲断连**：上游一个 token 都不吐的时间可能长达数百秒，Worker 侧不设 idle kill，避免误杀合法请求；客户端中断会立即同步终止上游连接。
 
 ## 许可证
 

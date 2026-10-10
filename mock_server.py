@@ -10,6 +10,7 @@ Endpoints:
 Behavior chosen by key substring:
   ok         - normal successful response (stream or non-stream)
   zero       - response with 0 output tokens
+  empty      - 200 SSE that closes without emitting a single frame
   partial    - stream cut off / incomplete
   streamerr  - in-stream failure event
   slow       - hangs to test client abort / timeout
@@ -24,7 +25,7 @@ Run: python3 mock_server.py [port]   (default 18090)
 import json
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODELS = {
     "data": [
@@ -37,7 +38,7 @@ MODELS = {
 
 def shape_for_key(auth):
     key = (auth or "").lower()
-    for s in ("zero", "partial", "streamerr", "slow", "exhausted", "limited", "badkey", "forbidden", "badrequest"):
+    for s in ("empty", "zero", "partial", "streamerr", "slow", "exhausted", "limited", "badkey", "forbidden", "badrequest"):
         if s in key:
             return s
     return "ok"
@@ -92,6 +93,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Retry-After", "3600")
             self.end_headers()
             self.wfile.write(json.dumps({"error": {"message": "rate limited", "type": "rate_limit_error"}}).encode())
+            return
+        if shape == "empty":
+            # 200 + SSE 头，一个帧都不发就结束：用于验证「零字节流不得谎报成功」
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
             return
         if shape == "slow":
             try:
@@ -269,4 +277,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 18090
     print(f"Provider API mock listening on 127.0.0.1:{port}", flush=True)
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # 线程化：slow 之类的阻塞型应答不应卡住后续请求
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
