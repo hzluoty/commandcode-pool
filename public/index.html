@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>commandcode-pool (Vercel)</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #151a22;
+    --border: #262e3a;
+    --text: #d7dee8;
+    --text-dim: #8b96a5;
+    --accent: #4f8cff;
+    --green: #34d399;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    max-width: 680px;
+    margin: 48px auto;
+    padding: 0 20px;
+    line-height: 1.6;
+  }
+  h1 { font-size: 24px; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+  h1 span.badge { font-size: 12px; background: rgba(79,140,255,0.15); color: var(--accent); padding: 2px 8px; border-radius: 6px; font-weight: normal; }
+  .sub { color: var(--text-dim); margin-bottom: 24px; font-size: 14.5px; }
+  h2 { font-size: 16px; margin: 24px 0 10px; color: #fff; }
+  code { background: #1a2029; color: #79c0ff; padding: 2px 6px; border-radius: 4px; font-size: 13px; font-family: var(--mono); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; margin-bottom: 16px; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  td:first-child { white-space: nowrap; font-family: var(--mono); color: #79c0ff; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 24px 28px; }
+  .btn { display: inline-block; background: var(--accent); color: #fff; padding: 7px 16px; border-radius: 6px; font-size: 13px; font-weight: 500; margin-top: 6px; }
+  .btn:hover { background: #3b76e1; text-decoration: none; }
+  .features { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+  .feat { background: #10151d; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 12.5px; }
+  .feat b { color: var(--green); }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Command Code Pool <span class="badge">Vercel Edition</span></h1>
+  <div class="sub">多账号号池 · 完美支持 Go 套餐 · OpenAI / Anthropic / Responses API 网关</div>
+
+  <div class="features">
+    <div class="feat"><b>✓ Go 套餐全面支持</b><br>自适应 CLI Wire 协议，解除 Provider API 403 限制</div>
+    <div class="feat"><b>✓ 确定性设备指纹</b><br>每账号独占虚拟硬件特征，防漂移降封号风险</div>
+    <div class="feat"><b>✓ 粘性缓存调度</b><br>Sticky 策略复用账号，最大化 Prompt Cache 命中率</div>
+    <div class="feat"><b>✓ 额度与窗口监控</b><br>5小时/周限制窗口、月度额度、自动故障转移与冷却</div>
+  </div>
+
+  <h2>兼容端点</h2>
+  <table>
+    <tr><td>POST /v1/chat/completions</td><td>OpenAI Chat Completions（流式 + 非流式）</td></tr>
+    <tr><td>POST /v1/messages</td><td>Anthropic Messages API（含 thinking / tool_use）</td></tr>
+    <tr><td>POST /v1/responses</td><td>OpenAI Responses API</td></tr>
+    <tr><td>GET /v1/models</td><td>模型目录（自动探测可用模型）</td></tr>
+    <tr><td>GET /health</td><td>服务健康检查</td></tr>
+  </table>
+
+  <h2>管理与控制台</h2>
+  <p><a href="/admin" class="btn">进入管理控制台 (/admin)</a></p>
+  <p style="font-size:12.5px;color:var(--text-dim);margin-top:8px">管理面板支持添加账号、一键刷新额度、查看 5 小时与周额度进度条、Token 消耗统计和在线测试。</p>
+
+  <h2>客户端调用说明</h2>
+  <p style="font-size:13px;color:var(--text-dim)">
+    对外调用鉴权：<code>Authorization: Bearer &lt;API_KEYS&gt;</code> 或 <code>x-api-key: &lt;key&gt;</code>。<br>
+    管理 API 鉴权：<code>X-Admin-Token: &lt;ADMIN_TOKEN&gt;</code>。
+  </p>
+</div>
+</body>
+</html>

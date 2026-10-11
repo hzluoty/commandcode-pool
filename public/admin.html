@@ -1,0 +1,879 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Command Code Pool - 控制台</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #151a22;
+    --panel-2: #1a2029;
+    --border: #262e3a;
+    --text: #d7dee8;
+    --text-dim: #8b96a5;
+    --text-faint: #5c6673;
+    --accent: #4f8cff;
+    --accent-dim: #2b5db8;
+    --green: #34d399;
+    --amber: #fbbf24;
+    --red: #f87171;
+    --go: #06b6d4;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px 60px; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .muted { color: var(--text-dim); }
+  .dim { color: var(--text-faint); }
+  .small { font-size: 12px; }
+  .hidden { display: none !important; }
+
+  header.bar { border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 0; z-index: 5; }
+  .bar-inner { display: flex; align-items: center; gap: 14px; padding-top: 10px; }
+  .logo { font-weight: 700; font-size: 15px; letter-spacing: .2px; white-space: nowrap; }
+  .logo span { color: var(--accent); }
+  .logo .tag { font-size: 11px; background: rgba(79,140,255,0.12); color: var(--accent); padding: 1px 6px; border-radius: 4px; margin-left: 6px; }
+  .spacer { flex: 1; }
+  nav.tabs { display: flex; gap: 4px; align-self: flex-end; }
+  nav.tabs button {
+    appearance: none; background: none; border: none; cursor: pointer;
+    color: var(--text-dim); font-size: 14px; padding: 9px 14px;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  nav.tabs button:hover { color: var(--text); }
+  nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 12px; margin: 18px 0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 13px 16px; min-width: 0; }
+  .card .label { color: var(--text-dim); font-size: 12px; margin-bottom: 5px; }
+  .card .value { font-family: var(--mono); font-size: 21px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .sub { color: var(--text-faint); font-size: 12px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
+  .panel > h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+  .panel-head h3 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
+  .panel .hint { color: var(--text-faint); font-size: 12px; margin: 10px 0 0; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: right; color: var(--text-faint); font-size: 12px; font-weight: 500; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; font-size: 13px; text-align: right; }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  tr.day-row { cursor: pointer; }
+  tr.day-row:hover td { background: var(--panel-2); }
+  tr.day-sub td { background: var(--panel-2); padding: 10px 14px; }
+  .day-sub table td, .day-sub table th { border-bottom-color: var(--border); background: none; }
+  .empty { text-align: center; color: var(--text-faint); font-size: 13px; padding: 26px 0; border: 1px dashed var(--border); border-radius: 10px; }
+
+  .badge {
+    display: inline-block; padding: 1px 8px; border-radius: 20px;
+    font-size: 11px; font-weight: 600; white-space: nowrap; line-height: 18px;
+  }
+  .badge.ok   { background: rgba(52,211,153,.12); color: var(--green); }
+  .badge.warn { background: rgba(251,191,36,.12); color: var(--amber); }
+  .badge.err  { background: rgba(248,113,113,.15); color: var(--red); }
+  .badge.info { background: rgba(79,140,255,.15); color: var(--accent); }
+  .badge.go   { background: rgba(6,182,212,.18); color: var(--go); border: 1px solid rgba(6,182,212,.3); }
+  .badge.off  { background: rgba(92,102,115,.15); color: var(--text-faint); }
+
+  .btn {
+    appearance: none; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel-2); color: var(--text); padding: 6px 14px;
+    font-size: 13px; cursor: pointer; transition: all .15s ease;
+  }
+  .btn:hover { background: #222933; border-color: var(--text-faint); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: #3b76e1; }
+  .btn.small { padding: 4px 10px; font-size: 12px; }
+  .btn.tiny { padding: 2px 7px; font-size: 11px; }
+  .btn.danger { color: var(--red); }
+  .btn.danger:hover { background: rgba(248,113,113,.15); border-color: var(--red); }
+
+  input[type=text], input[type=password], select, textarea {
+    width: 100%; background: #0d1117; color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 11px; font-size: 13.5px; outline: none; font-family: inherit;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent-dim); }
+  label.field { display: block; margin-bottom: 14px; }
+  label.field .cap { display: block; color: var(--text-dim); font-size: 12.5px; margin-bottom: 5px; }
+  label.check { display: flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 12.5px; cursor: pointer; }
+  label.check input { accent-color: var(--accent); }
+
+  .error-msg {
+    background: rgba(248,113,113,.08); border: 1px solid rgba(248,113,113,.4); border-radius: 8px;
+    padding: 9px 14px; font-size: 13px; color: var(--red);
+    margin: 0 0 14px; display: none;
+  }
+  .error-msg.show { display: block; }
+
+  .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 0; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  #days-seg { flex-wrap: wrap; overflow: visible; }
+  #days-seg button { flex: 0 0 auto; }
+  .seg button {
+    appearance: none; background: var(--panel); border: none; cursor: pointer;
+    color: var(--text-dim); font-size: 12.5px; padding: 6px 13px;
+    border-right: 1px solid var(--border);
+  }
+  .seg button:last-child { border-right: none; }
+  .seg button:hover { color: var(--text); }
+  .seg button.active { background: var(--accent); color: #fff; font-weight: 600; }
+
+  /* 登录 */
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @keyframes tabIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .login-box { max-width: 400px; margin: 12vh auto 0; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 26px 26px 22px; animation: rise .35s ease-out both; }
+  .login-box .title { text-align: center; font-size: 19px; font-weight: 700; margin-bottom: 4px; }
+  .login-box .title span { color: var(--accent); }
+  .login-box .desc { text-align: center; color: var(--text-dim); font-size: 13px; margin-bottom: 22px; }
+  .login-err { color: var(--red); font-size: 12.5px; min-height: 18px; margin: 8px 0 6px; text-align: center; }
+  .login-hint { text-align: center; color: var(--text-faint); font-size: 11.5px; margin-top: 14px; }
+  section[id^="tab-"] { animation: tabIn .22s ease-out; }
+
+  /* 账号卡片 */
+  .acc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+  .acc-card { background: #0d1117; border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .acc-card.is-go { border-left: 3px solid var(--go); }
+  .acc-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+  .acc-title { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+  .acc-label { font-size: 14px; font-weight: 600; color: var(--text); cursor: pointer; }
+  .acc-label:hover { color: var(--accent); }
+  .acc-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .bal-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; font-size: 11px; color: var(--text-dim); align-items: center; }
+  .bal { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; color: var(--text-dim); }
+  .bal b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .window { margin-bottom: 10px; }
+  .window:last-child { margin-bottom: 0; }
+  .window-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+  .window-label { font-size: 12px; font-weight: 600; }
+  .window-pct { font-size: 13.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bar-bg { height: 8px; border-radius: 5px; background: var(--panel-2); overflow: hidden; margin-bottom: 3px; }
+  .bar-fill { height: 100%; border-radius: 5px; transition: width .4s ease; }
+  .window-detail { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); }
+  .window-detail .reset { color: var(--text-faint); }
+  .acc-usage { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); color: var(--text-dim); font-size: 11.5px; }
+  .acc-usage b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .acc-foot { font-size: 10.5px; color: var(--text-faint); margin-top: 8px; }
+  .acc-foot .err { color: var(--red); }
+  .acc-detail { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
+  .acc-detail .stat { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); }
+  .acc-detail .stat b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+  .acc-detail .stat.wide { grid-column: 1 / -1; }
+  .acc-detail .empty-note { grid-column: 1 / -1; text-align: center; font-size: 11px; color: var(--text-faint); padding: 4px 0; }
+
+  .add-form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .add-form input { flex: 1; min-width: 160px; }
+
+  /* 图表 */
+  .chart { display: flex; align-items: stretch; gap: 6px; overflow-x: auto; padding-top: 6px; min-height: 185px; }
+  .chart .col { flex: 1; min-width: 22px; max-width: 40px; display: flex; flex-direction: column; align-items: center; gap: 5px; }
+  .chart .stack { height: 150px; width: 100%; max-width: 30px; display: flex; flex-direction: column; justify-content: flex-end; border-radius: 4px 4px 0 0; }
+  .chart .stack i { display: block; width: 100%; }
+  .chart .seg-in { background: var(--accent); border-radius: 3px 3px 0 0; }
+  .chart .seg-out { background: var(--green); }
+  .chart .col span { font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
+  .legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--text-dim); margin: 4px 0 10px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+  /* 测试窗口 */
+  .test-console { display: flex; flex-direction: column; gap: 10px; }
+  .test-output { background: #080b0f; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 12.5px; color: #a5d6ff; min-height: 160px; max-height: 350px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+
+  @media (max-width: 720px) {
+    .bar-inner { flex-wrap: wrap; }
+    nav.tabs { order: 3; width: 100%; }
+    .acc-detail { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- 登录 -->
+<div id="view-login" class="wrap" style="display:none">
+  <div class="login-box">
+    <div class="title">Command Code <span>Pool</span></div>
+    <div class="desc">多账号号池 · 完美支持 Go 套餐 · Vercel 云端部署</div>
+
+    <form id="loginForm" autocomplete="on">
+      <label class="field"><span class="cap">管理密码 (ADMIN_TOKEN)</span>
+        <input type="password" id="login-token" placeholder="留空则免密进入（未配置 ADMIN_TOKEN 时）" autocomplete="current-password">
+      </label>
+      <label class="check"><input type="checkbox" id="login-remember" checked> 记住我（本浏览器记住密码）</label>
+      <div class="login-err" id="login-err"></div>
+      <button type="submit" class="btn primary" id="login-btn" style="width:100%;padding:9px;font-weight:600">进 入 控 制 台</button>
+    </form>
+    <div class="login-hint">支持 Vercel Serverless Function 零配置即开即用</div>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="view-app" style="display:none">
+  <header class="bar"><div class="wrap bar-inner">
+    <div class="logo">Command Code <span>Pool</span> <span class="tag">Vercel</span></div>
+    <nav class="tabs">
+      <button id="tabbtn-quota" class="active" type="button">额度与账号</button>
+      <button id="tabbtn-usage" type="button">用量统计</button>
+      <button id="tabbtn-test" type="button">在线测试</button>
+    </nav>
+    <div class="spacer"></div>
+    <label class="check"><input type="checkbox" id="auto-refresh"> 自动刷新</label>
+    <button class="btn small" id="refresh-all" type="button">全部刷新</button>
+    <button class="btn small" id="logout" type="button">退出</button>
+  </div></header>
+
+  <div class="wrap">
+    <div id="app-err" class="error-msg" style="margin-top:14px"></div>
+
+    <!-- Tab 1: 额度与账号 -->
+    <section id="tab-quota">
+      <div class="cards" id="metrics"></div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>账号额度与使用情况 (支持 Go 套餐 / Pro / GOAT 等)</h3>
+          <button class="btn small primary" id="add-toggle" type="button">+ 添加账号</button>
+        </div>
+        <form id="add-form" class="add-form hidden">
+          <input type="text" id="add-label" placeholder="备注名（可留空，自动取用户名）">
+          <input type="password" id="add-key" placeholder="API 密钥 (user_...，从 commandcode.ai 获取)">
+          <button class="btn primary" type="submit" id="add-btn">确认添加</button>
+          <button class="btn small" type="button" id="add-browser-btn" title="生成并打开 Command Code Studio 授权页">浏览器登录</button>
+        </form>
+        <p class="hint" style="margin:0 0 12px">
+          💡 <b>Go 套餐说明</b>：Go 套餐账号在此号池中享有原生调用与用量记录支持；系统已内置 9 键 CLI 信封与设备指纹透明代理，彻底解决 Provider API 403 upgrade_required 报错。
+        </p>
+        <div id="acc-grid" class="acc-grid"></div>
+      </div>
+    </section>
+
+    <!-- Tab 2: 用量统计 -->
+    <section id="tab-usage" style="display:none">
+      <div class="toolbar">
+        <div class="seg" id="days-seg">
+          <button type="button" data-range="5m">5分钟</button>
+          <button type="button" data-range="1h">1小时</button>
+          <button type="button" data-range="5h">5小时</button>
+          <button type="button" data-range="1d" class="active">1天</button>
+          <button type="button" data-range="3d">3天</button>
+          <button type="button" data-range="7d">7天</button>
+          <button type="button" data-range="30d">30天</button>
+        </div>
+        <span class="muted small" id="usage-meta"></span>
+      </div>
+      <div class="cards" id="usage-summary"></div>
+      <div class="panel">
+        <h3>时间段 Token 用量（输入 / 输出堆叠）</h3>
+        <div class="legend">
+          <span><i style="background:var(--accent)"></i>输入（含缓存读）</span>
+          <span><i style="background:var(--green)"></i>输出</span>
+        </div>
+        <div id="chart" class="chart"></div>
+      </div>
+      <div class="panel">
+        <h3>按时间段明细（点击行展开分账号）</h3>
+        <div id="daily-table"></div>
+      </div>
+    </section>
+
+    <!-- Tab 3: 在线测试 -->
+    <section id="tab-test" style="display:none">
+      <div class="panel">
+        <h3>调用测试 (Playground)</h3>
+        <div class="test-console">
+          <div style="display:flex;gap:10px;align-items:center;">
+            <label style="min-width:60px;font-size:13px;color:var(--text-dim);">模型:</label>
+            <input type="text" id="test-model" value="deepseek/deepseek-v4-flash" style="flex:1;">
+            <label class="check"><input type="checkbox" id="test-stream" checked> 流式输出 (SSE)</label>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start;">
+            <label style="min-width:60px;font-size:13px;color:var(--text-dim);margin-top:8px;">Prompt:</label>
+            <textarea id="test-prompt" rows="3" placeholder="输入测试问题，例如：你好，请用一句话介绍你自己">你好，请告诉我当前运行的模型和用一句话介绍你自己。</textarea>
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:10px;">
+            <button class="btn primary" id="test-send-btn" type="button">发 送 调 用</button>
+          </div>
+          <div style="margin-top:6px;font-size:12px;color:var(--text-dim);">响应输出:</div>
+          <div id="test-result" class="test-output">点击“发送调用”开始测试号池。</div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var TOKEN_KEY = 'cc_pool.token';
+  var $ = function (id) { return document.getElementById(id); };
+  var esc = function (s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  };
+  var fmt = function (n) { return Number(n || 0).toLocaleString('zh-CN'); };
+  var fmtT = function (n) {
+    if (n == null || isNaN(Number(n))) return '—';
+    n = Number(n);
+    if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿';
+    if (n >= 1e4) return (n / 1e4).toFixed(1) + '万';
+    return String(n);
+  };
+  var fmtC = function (v) {
+    if (v == null || isNaN(Number(v))) return '—';
+    var n = Number(v);
+    return n % 1 === 0 ? String(n) : n.toFixed(2);
+  };
+  var fmtPct = function (v) {
+    if (v == null || isNaN(Number(v))) return '—';
+    var n = Number(v).toFixed(1);
+    if (n.slice(-2) === '.0') n = n.slice(0, -2);
+    return n + '%';
+  };
+  var pctColor = function (usedPct) {
+    if (usedPct >= 90) return 'var(--red)';
+    if (usedPct >= 75) return 'var(--amber)';
+    return 'var(--green)';
+  };
+  var formatDuration = function (seconds) {
+    seconds = Math.max(0, Math.floor(seconds));
+    var d = Math.floor(seconds / 86400); seconds = seconds % 86400;
+    var h = Math.floor(seconds / 3600); seconds = seconds % 3600;
+    var m = Math.floor(seconds / 60);
+    if (d > 0) return d + '天' + (h > 0 ? h + '小时' : '');
+    if (h > 0) return h + '小时' + (m > 0 ? m + '分' : '');
+    return Math.max(1, m) + '分钟';
+  };
+  var fmtTime = function (ts) {
+    if (!ts) return '从未';
+    var d = new Date(ts);
+    var pad = function (n) { return String(n).padStart(2, '0'); };
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  };
+
+  var adminToken = localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY) || '';
+  var accounts = [];
+  var dailyData = null;
+  var dailyRange = '1d';
+  var curTab = 'quota';
+  var expandedAcc = new Set();
+  var expandedDay = new Set();
+  var autoTimer = null;
+
+  function setView(view) {
+    $('view-login').style.display = view === 'login' ? 'block' : 'none';
+    $('view-app').style.display = view === 'app' ? 'block' : 'none';
+  }
+
+  function appError(msg) {
+    var el = $('app-err');
+    if (!msg) { el.classList.remove('show'); el.textContent = ''; return; }
+    el.textContent = msg; el.classList.add('show');
+  }
+
+  async function api(path, opts) {
+    opts = opts || {};
+    var headers = Object.assign({
+      'Content-Type': 'application/json',
+      'X-Admin-Token': adminToken,
+    }, opts.headers || {});
+    var resp = await fetch(path, Object.assign({}, opts, { headers: headers }));
+    if (resp.status === 401) {
+      adminToken = '';
+      sessionStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(TOKEN_KEY);
+      setView('login');
+      throw new Error('未授权，请登录');
+    }
+    var data = await resp.json().catch(function () { return {}; });
+    if (!resp.ok) {
+      throw new Error(data.error?.message || data.error || ('HTTP ' + resp.status));
+    }
+    return data;
+  }
+
+  function switchTab(t) {
+    curTab = t;
+    ['quota', 'usage', 'test'].forEach(function (name) {
+      $('tabbtn-' + name).classList.toggle('active', name === t);
+      $('tab-' + name).style.display = name === t ? 'block' : 'none';
+    });
+    if (t === 'quota') loadQuota();
+    else if (t === 'usage') loadDaily();
+  }
+
+  // ---------- Tab 1: 额度与账号 ----------
+  async function loadQuota() {
+    try {
+      var res = await api('/api/accounts');
+      accounts = res.accounts || [];
+      renderMetrics();
+      renderAccounts();
+    } catch (e) {
+      if (e.message !== '未授权，请登录') appError(e.message);
+    }
+  }
+
+  function renderMetrics() {
+    var totalAcc = accounts.length;
+    var enabledAcc = accounts.filter(function (a) { return a.enabled; }).length;
+    var goAcc = accounts.filter(function (a) { return a.plan && (a.plan.isGoPlan || a.plan.planId === 'individual-go'); }).length;
+    var totalReq = accounts.reduce(function (s, a) { return s + (a.usage?.requests || 0); }, 0);
+    var totalTokens = accounts.reduce(function (s, a) { return s + (a.usage?.promptTokens || 0) + (a.usage?.completionTokens || 0); }, 0);
+
+    var cards = [
+      { label: '总账号数', value: fmt(totalAcc), sub: '启用 ' + enabledAcc + ' / 停用 ' + (totalAcc - enabledAcc) },
+      { label: 'Go 套餐账号', value: fmt(goAcc), sub: '自动 CLI 9键信封兼容' },
+      { label: '网关累计调用', value: fmt(totalReq), sub: '请求数' },
+      { label: '网关累计 Tokens', value: fmtT(totalTokens), sub: '输入+输出总计' },
+    ];
+    $('metrics').innerHTML = cards.map(function (c) {
+      return '<div class="card"><div class="label">' + c.label + '</div><div class="value">' + c.value + '</div><div class="sub">' + c.sub + '</div></div>';
+    }).join('');
+  }
+
+  function monthlyWindow(a) {
+    var c = a.credits || {};
+    var cap = c.monthlyCap;
+    if (cap == null) return null;
+    var used = c.monthlyUsed != null ? c.monthlyUsed : Math.max(0, cap - (c.monthlyCredits || 0));
+    return {
+      used: used,
+      cap: cap,
+      resetAt: a.detail?.currentPeriodEnd || 0,
+      exceeded: false,
+    };
+  }
+
+  function windowHtml(label, w, note) {
+    if (!w || !w.cap || w.cap <= 0) return '';
+    var usedPct = Math.min(100, Number(w.used || 0) / Number(w.cap) * 100);
+    var leftPct = Math.max(0, 100 - usedPct);
+    var resetText = '暂无重置点';
+    if (w.resetAt) {
+      var sec = Math.floor((Number(w.resetAt) - Date.now()) / 1000);
+      resetText = sec > 0 ? '重置于 ' + formatDuration(sec) + ' 后' : '窗口已达重置点';
+    }
+    return '<div class="window">'
+      + '<div class="window-header"><span class="window-label">' + label + (w.exceeded ? ' <span class="badge err">已用满</span>' : '') + '</span>'
+      + '<span class="window-pct" style="color:' + pctColor(usedPct) + '">剩余 ' + leftPct.toFixed(1) + '%</span></div>'
+      + '<div class="bar-bg"><div class="bar-fill" style="width:' + leftPct + '%;background:' + pctColor(usedPct) + '"></div></div>'
+      + '<div class="window-detail"><span>已用 ' + fmtC(w.used) + ' / ' + fmtC(w.cap) + ' · 剩余 ' + fmtC(Math.max(Number(w.cap) - Number(w.used || 0), 0)) + (note ? ' <span class="dim">(' + note + ')</span>' : '') + '</span>'
+      + '<span class="reset">' + resetText + '</span></div>'
+      + '</div>';
+  }
+
+  function detailHtml(a) {
+    var d = a.detail || {};
+    var u = d.summary;
+    var rows = [];
+    if (u) {
+      rows.push(['累计请求', fmt(u.requests)]);
+      rows.push(['成功率', fmtPct(u.successRate)]);
+      rows.push(['消耗额度', fmtC(u.creditsSpent) + ' credits']);
+      rows.push(['Tokens 进 / 出', fmtT(u.tokensIn) + ' / ' + fmtT(u.tokensOut)]);
+      if (u.periodBasis) rows.push(['统计口径', esc(u.periodBasis)]);
+    }
+    if (d.plan?.currentPeriodEnd) rows.push(['账期至', fmtTime(d.plan.currentPeriodEnd)]);
+    if (d.plan?.status) rows.push(['订阅状态', esc(d.plan.status)]);
+    var html = rows.length
+      ? rows.map(function (r) { return '<div class="stat"><span>' + r[0] + '</span><b>' + r[1] + '</b></div>'; }).join('')
+      : '<div class="empty-note">暂无上游明细数据，刷新额度后记录。</div>';
+    return '<div class="acc-detail">' + html + '</div>';
+  }
+
+  function accountHtml(a) {
+    var c = a.credits || {};
+    var d = a.detail || {};
+    var isGo = a.plan && (a.plan.isGoPlan || a.plan.planId === 'individual-go');
+    var badges = '';
+    if (isGo) badges += '<span class="badge go">Go 套餐 (10 credits)</span>';
+    else if (a.plan && a.plan.name) badges += '<span class="badge info">' + esc(a.plan.name) + '</span>';
+
+    if (a.pool && a.pool.rateLimited) badges += '<span class="badge err" title="429 冷却中">冷却中</span>';
+    if (!a.enabled) badges += '<span class="badge off">停用</span>';
+    if (a.lastError) badges += '<span class="badge err" title="' + esc(a.lastError) + '">上次报错</span>';
+
+    var open = expandedAcc.has(a.id);
+    var usage = a.usage || {};
+
+    return '<div class="acc-card ' + (isGo ? 'is-go' : '') + '">'
+      + '<div class="acc-head"><div class="acc-title">'
+      + '<span class="acc-label" data-rename="' + a.id + '" title="点击修改备注">' + esc(a.label || ('#' + a.id)) + '</span>'
+      + badges
+      + '<span class="mono dim">' + esc(a.maskedKey || '') + '</span>'
+      + '</div><div class="acc-actions">'
+      + '<button class="btn tiny" data-detail="' + a.id + '" type="button">' + (open ? '收起' : '详情') + '</button>'
+      + '<button class="btn tiny" data-refresh="' + a.id + '" type="button">刷新</button>'
+      + '<button class="btn tiny" data-toggle="' + a.id + '" type="button">' + (a.enabled ? '停用' : '启用') + '</button>'
+      + '<button class="btn tiny danger" data-del="' + a.id + '" type="button">删除</button>'
+      + '</div></div>'
+      + '<div class="bal-row">'
+      + '<span class="bal">月度剩余 <b>' + fmtC(c.monthlyCredits) + '</b></span>'
+      + '<span class="bal">充值余额 <b>' + fmtC(c.purchasedCredits) + '</b></span>'
+      + '<span class="bal">免费额度 <b>' + fmtC(c.freeCredits) + '</b></span>'
+      + '</div>'
+      + windowHtml('5 小时滚动', c.fiveHour, '上游窗口')
+      + windowHtml('周限额', c.weekly, '上游窗口')
+      + windowHtml('月度额度', monthlyWindow(a), isGo ? 'Go 套餐标准 10 额度' : '按套餐推算')
+      + '<div class="acc-usage">网关累计：请求 <b>' + fmt(usage.requests) + '</b> · 输入 <b>' + fmtT(usage.promptTokens) + '</b> · 输出 <b>' + fmtT(usage.completionTokens) + '</b> · 缓存读 <b>' + fmtT(usage.cacheReadTokens) + '</b></div>'
+      + (open ? detailHtml(a) : '')
+      + '<div class="acc-foot">最后使用: ' + esc(fmtTime(a.lastUsedAt)) + (a.lastError ? ' · <span class="err">' + esc(a.lastError) + '</span>' : '') + '</div>'
+      + '</div>';
+  }
+
+  function renderAccounts() {
+    var host = $('acc-grid');
+    if (!accounts.length) {
+      host.innerHTML = '<div class="empty" style="grid-column:1/-1">号池中暂无账号。点击右上角「+ 添加账号」录入第一把 Command Code 密钥。</div>';
+      return;
+    }
+    host.innerHTML = accounts.map(accountHtml).join('');
+  }
+
+  // ---------- Tab 2: 用量统计 ----------
+  async function loadDaily() {
+    try {
+      var res = await api('/api/usage/daily?range=' + encodeURIComponent(dailyRange));
+      dailyData = res;
+      renderUsage();
+    } catch (e) {
+      if (e.message !== '未授权，请登录') appError(e.message);
+    }
+  }
+
+  function renderUsage() {
+    if (!dailyData) return;
+    var rows = dailyData.daily || [];
+    var t = dailyData.totals || {};
+    var hit = Number(t.promptTokens || 0) > 0 ? Math.round(Number(t.cacheReadTokens || 0) / Number(t.promptTokens) * 100) : null;
+    var tz = Number(dailyData.tzOffset || 8);
+    var cards = [
+      { label: '合计请求', value: fmt(t.requests), sub: '近 ' + dailyRange },
+      { label: '输入 Tokens', value: fmtT(t.promptTokens), sub: '含缓存读 ' + fmtT(t.cacheReadTokens) },
+      { label: '输出 Tokens', value: fmtT(t.completionTokens), sub: '生成总 Tokens' },
+      { label: '缓存命中率', value: hit == null ? '—' : hit + '%', sub: 'Cache 读 / 输入' },
+    ];
+    $('usage-summary').innerHTML = cards.map(function (c) {
+      return '<div class="card"><div class="label">' + c.label + '</div><div class="value">' + c.value + '</div><div class="sub">' + c.sub + '</div></div>';
+    }).join('');
+    $('usage-meta').textContent = '时区 UTC+' + tz + ' · 统计点数 ' + rows.length;
+    renderChart(rows);
+    renderDailyTable(rows);
+  }
+
+  function renderChart(rows) {
+    var host = $('chart');
+    if (!rows.length) { host.innerHTML = '<div class="empty" style="width:100%">暂无该时间段内的用量数据</div>'; return; }
+    var max = 1;
+    rows.forEach(function (r) { max = Math.max(max, Number(r.promptTokens || 0) + Number(r.completionTokens || 0)); });
+    host.innerHTML = rows.map(function (r) {
+      var p = Number(r.promptTokens || 0), o = Number(r.completionTokens || 0);
+      var ph = Math.round(p / max * 140), oh = Math.round(o / max * 140);
+      if (p > 0) ph = Math.max(ph, 3);
+      if (o > 0) oh = Math.max(oh, 3);
+      return '<div class="col" title="' + esc(r.day) + '&#10;请求: ' + fmt(r.requests) + '&#10;输入: ' + fmtT(p) + '&#10;输出: ' + fmtT(o) + '">'
+        + '<div class="stack">'
+        + (oh > 0 ? '<i class="seg-out" style="height:' + oh + 'px"></i>' : '')
+        + (ph > 0 ? '<i class="seg-in" style="height:' + ph + 'px"></i>' : '')
+        + '</div><span>' + esc(String(r.day).slice(5)) + '</span></div>';
+    }).join('');
+  }
+
+  function renderDailyTable(rows) {
+    var host = $('daily-table');
+    if (!rows.length) { host.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+    var trs = rows.map(function (r) {
+      var total = Number(r.promptTokens || 0) + Number(r.completionTokens || 0);
+      var open = expandedDay.has(r.day);
+      var html = '<tr class="day-row" data-day="' + esc(r.day) + '">'
+        + '<td>' + esc(r.day) + (open ? ' ▾' : ' ▸') + '</td>'
+        + '<td class="num">' + fmt(r.requests) + '</td>'
+        + '<td class="num">' + fmt(r.promptTokens) + '</td>'
+        + '<td class="num">' + fmt(r.completionTokens) + '</td>'
+        + '<td class="num">' + fmt(r.cacheReadTokens) + '</td>'
+        + '<td class="num"><b>' + fmt(total) + '</b></td>'
+        + '</tr>';
+      if (open) {
+        var subs = (r.accounts || []).map(function (s) {
+          return '<tr><td>' + esc(s.label || ('#' + s.id)) + '</td>'
+            + '<td class="num">' + fmt(s.requests) + '</td>'
+            + '<td class="num">' + fmt(s.promptTokens) + '</td>'
+            + '<td class="num">' + fmt(s.completionTokens) + '</td>'
+            + '<td class="num">' + fmt(s.cacheReadTokens) + '</td>'
+            + '<td class="num">' + fmt(Number(s.promptTokens || 0) + Number(s.completionTokens || 0)) + '</td></tr>';
+        }).join('');
+        html += '<tr class="day-sub"><td colspan="6"><table>'
+          + '<thead><tr><th>账号</th><th>请求</th><th>输入</th><th>输出</th><th>缓存读</th><th>合计</th></tr></thead>'
+          + (subs || '<tr><td colspan="6" class="dim">该时段无分账号明细</td></tr>')
+          + '</table></td></tr>';
+      }
+      return html;
+    }).join('');
+    host.innerHTML = '<table><thead><tr><th>时间段</th><th>请求</th><th>输入</th><th>输出</th><th>缓存读</th><th>合计</th></tr></thead><tbody>' + trs + '</tbody></table>';
+  }
+
+  // ---------- 事件绑定 ----------
+  $('tabbtn-quota').addEventListener('click', function () { switchTab('quota'); });
+  $('tabbtn-usage').addEventListener('click', function () { switchTab('usage'); });
+  $('tabbtn-test').addEventListener('click', function () { switchTab('test'); });
+
+  $('refresh-all').addEventListener('click', async function () {
+    var btn = this;
+    btn.disabled = true; btn.textContent = '刷新中…';
+    try {
+      await api('/api/refresh', { method: 'POST', body: '{}' });
+      appError('');
+      await loadQuota();
+    } catch (e) {
+      if (e.message !== '未授权，请登录') appError(e.message);
+    } finally {
+      btn.disabled = false; btn.textContent = '全部刷新';
+    }
+  });
+
+  $('auto-refresh').addEventListener('change', function () {
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+    if (this.checked) {
+      autoTimer = setInterval(function () {
+        loadQuota();
+        if (curTab === 'usage') loadDaily();
+      }, 30000);
+    }
+  });
+
+  $('add-toggle').addEventListener('click', function () {
+    var f = $('add-form');
+    f.classList.toggle('hidden');
+    if (!f.classList.contains('hidden')) $('add-key').focus();
+  });
+
+  $('add-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    var key = $('add-key').value.trim();
+    var label = $('add-label').value.trim();
+    if (!key) { appError('请填写 API 密钥'); return; }
+    $('add-btn').disabled = true; $('add-btn').textContent = '验证中…';
+    try {
+      await api('/api/accounts', { method: 'POST', body: JSON.stringify({ key: key, label: label }) });
+      $('add-key').value = ''; $('add-label').value = '';
+      $('add-form').classList.add('hidden');
+      appError('');
+      await loadQuota();
+    } catch (e2) {
+      appError(e2.message || '添加失败');
+    } finally {
+      $('add-btn').disabled = false; $('add-btn').textContent = '确认添加';
+    }
+  });
+
+  // 浏览器辅助登录
+  $('add-browser-btn').addEventListener('click', async function () {
+    try {
+      var res = await api('/api/auth/browser-url');
+      if (res.authUrl) {
+        window.open(res.authUrl, '_blank');
+        alert('已打开 Command Code Studio 授权页。\n授权完成后复制页面显示的 API Key 并粘贴到输入框即可完成添加。');
+        $('add-key').focus();
+      }
+    } catch (e) {
+      alert('获取授权链接失败: ' + e.message);
+    }
+  });
+
+  $('acc-grid').addEventListener('click', async function (e) {
+    var el = e.target.closest ? e.target.closest('[data-detail],[data-refresh],[data-toggle],[data-del],[data-rename]') : null;
+    if (!el) return;
+    var id = Number(el.dataset.detail || el.dataset.refresh || el.dataset.toggle || el.dataset.del || el.dataset.rename);
+
+    if (el.dataset.detail) {
+      if (expandedAcc.has(id)) expandedAcc.delete(id); else expandedAcc.add(id);
+      renderAccounts();
+    } else if (el.dataset.refresh) {
+      el.disabled = true; el.textContent = '…';
+      try {
+        await api('/api/refresh', { method: 'POST', body: JSON.stringify({ id: id }) });
+        await loadQuota();
+      } catch (e2) { appError(e2.message); }
+    } else if (el.dataset.toggle) {
+      var acct = accounts.find(function (a) { return a.id === id; });
+      if (!acct) return;
+      try {
+        await api('/api/accounts/' + id, { method: 'PATCH', body: JSON.stringify({ enabled: !acct.enabled }) });
+        await loadQuota();
+      } catch (e3) { appError(e3.message); }
+    } else if (el.dataset.del) {
+      if (!confirm('确认删除账号 #' + id + ' 吗？')) return;
+      try {
+        await api('/api/accounts/' + id, { method: 'DELETE' });
+        await loadQuota();
+      } catch (e4) { appError(e4.message); }
+    } else if (el.dataset.rename) {
+      var acct2 = accounts.find(function (a) { return a.id === id; });
+      var newName = prompt('输入新备注名：', acct2 ? acct2.label : '');
+      if (newName != null && newName.trim() !== (acct2 ? acct2.label : '')) {
+        try {
+          await api('/api/accounts/' + id, { method: 'PATCH', body: JSON.stringify({ label: newName.trim() }) });
+          await loadQuota();
+        } catch (e5) { appError(e5.message); }
+      }
+    }
+  });
+
+  $('days-seg').addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('button[data-range]') : null;
+    if (!btn) return;
+    $('days-seg').querySelectorAll('button').forEach(function (b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+    dailyRange = btn.dataset.range;
+    loadDaily();
+  });
+
+  $('daily-table').addEventListener('click', function (e) {
+    var tr = e.target.closest ? e.target.closest('tr.day-row') : null;
+    if (!tr) return;
+    var day = tr.dataset.day;
+    if (expandedDay.has(day)) expandedDay.delete(day); else expandedDay.add(day);
+    if (dailyData) renderDailyTable(dailyData.daily || []);
+  });
+
+  // ---------- 在线测试 (Playground) ----------
+  $('test-send-btn').addEventListener('click', async function () {
+    var btn = this;
+    var model = $('test-model').value.trim() || 'deepseek/deepseek-v4-flash';
+    var prompt = $('test-prompt').value.trim();
+    var isStream = $('test-stream').checked;
+    var outEl = $('test-result');
+
+    if (!prompt) return;
+    btn.disabled = true; btn.textContent = '请求中…';
+    outEl.textContent = '正在连接号池发送请求…\n';
+
+    var startTime = Date.now();
+    try {
+      var resp = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: model,
+          messages: [{ role: 'user', content: prompt }],
+          stream: isStream,
+        }),
+      });
+
+      if (!resp.ok) {
+        var errJson = await resp.json().catch(function () { return {}; });
+        outEl.textContent = '❌ 请求失败 (' + resp.status + '):\n' + JSON.stringify(errJson, null, 2);
+        return;
+      }
+
+      if (isStream) {
+        outEl.textContent = '';
+        var reader = resp.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        while (true) {
+          var res = await reader.read();
+          if (res.done) break;
+          buffer += decoder.decode(res.value, { stream: true });
+          var lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line.startsWith('data:')) {
+              var payload = line.slice(5).trim();
+              if (payload === '[DONE]') continue;
+              try {
+                var chunk = JSON.parse(payload);
+                var delta = chunk.choices?.[0]?.delta;
+                if (delta?.content) outEl.textContent += delta.content;
+                if (delta?.reasoning_content) outEl.textContent += '\n[思考] ' + delta.reasoning_content + '\n';
+              } catch (e) {}
+            }
+          }
+        }
+        outEl.textContent += '\n\n✓ 完成 (耗时: ' + (Date.now() - startTime) + 'ms)';
+      } else {
+        var data = await resp.json();
+        var choice = data.choices?.[0]?.message;
+        outEl.textContent = (choice?.reasoning_content ? '[思考]\n' + choice.reasoning_content + '\n\n' : '')
+          + (choice?.content || '')
+          + '\n\n[Tokens] Prompt: ' + (data.usage?.prompt_tokens || 0)
+          + ' · Completion: ' + (data.usage?.completion_tokens || 0)
+          + ' · 耗时: ' + (Date.now() - startTime) + 'ms';
+      }
+      // 刷新用量
+      if (curTab === 'quota') loadQuota();
+    } catch (err) {
+      outEl.textContent = '❌ 发生错误: ' + err.message;
+    } finally {
+      btn.disabled = false; btn.textContent = '发 送 调 用';
+    }
+  });
+
+  // ---------- 登录表单 ----------
+  $('loginForm').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    var pwd = $('login-token').value.trim();
+    $('login-btn').disabled = true; $('login-btn').textContent = '验证中…';
+    $('login-err').textContent = '';
+
+    try {
+      var resp = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pwd }),
+      });
+      var data = await resp.json().catch(function () { return {}; });
+      if (!resp.ok) {
+        throw new Error(data.error || '密码错误');
+      }
+      adminToken = pwd;
+      if ($('login-remember').checked) localStorage.setItem(TOKEN_KEY, pwd);
+      else sessionStorage.setItem(TOKEN_KEY, pwd);
+      setView('app');
+      loadQuota();
+    } catch (err) {
+      $('login-err').textContent = err.message || '登录失败';
+    } finally {
+      $('login-btn').disabled = false; $('login-btn').textContent = '进 入 控 制 台';
+    }
+  });
+
+  $('logout').addEventListener('click', function () {
+    adminToken = '';
+    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
+    setView('login');
+  });
+
+  // 初始化：自动测试已有 token 或直接进入
+  (async function init() {
+    try {
+      var res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: adminToken }),
+      });
+      if (res.ok) {
+        setView('app');
+        loadQuota();
+        return;
+      }
+    } catch (e) {}
+    setView('login');
+  })();
+
+})();
+</script>
+</body>
+</html>

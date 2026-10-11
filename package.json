@@ -1,0 +1,26 @@
+{
+  "name": "commandcode-pool",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-account pool for Command Code (full Go plan support), deployed on Vercel with OpenAI, Anthropic, and Responses compatible endpoints",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js",
+    "dev": "node api/index.js",
+    "test": "node test/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "commandcode",
+    "commandcode-pool",
+    "vercel",
+    "openai",
+    "anthropic",
+    "llm-proxy"
+  ],
+  "author": "",
+  "license": "MIT"
+}
