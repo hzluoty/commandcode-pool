@@ -2,6 +2,7 @@
 // Vercel Serverless Function 主入口 & 本地独立运行服务器
 // 全功能支持：多账号号池、Go 套餐登录/调用/用量、OpenAI/Anthropic/Responses 兼容接口、Web 管理控制台
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -432,24 +433,11 @@ export async function handleRequest(request) {
   // 浏览器辅助登录：生成 Command Code Studio 授权 URL
   if (pathName === '/api/auth/browser-url' && request.method === 'GET') {
     if (!verifyAdminAuth(request, config)) return json({ error: '未授权' }, 401);
-    const origin = url.origin;
-    const callbackUrl = `${origin}/api/auth/callback`;
-    const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
-    const authUrl = `${STUDIO_BASE_URL}/studio/auth/cli?callback=${encodeURIComponent(callbackUrl)}&state=${encodeURIComponent(state)}`;
+    // Studio 仅允许 localhost 回调：授权后浏览器会跳到本机(无监听)，由前端从地址栏 URL 中提取 apiKey
+    const callbackUrl = 'http://127.0.0.1:8976/callback';
+    const state = crypto.randomUUID();
+    const authUrl = `${STUDIO_BASE_URL}/studio/auth/cli?callback=${encodeURIComponent(callbackUrl)}&state=${encodeURIComponent(state)}&mode=redirect`;
     return json({ authUrl, callbackUrl, state });
-  }
-
-  // 浏览器回调处理
-  if (pathName === '/api/auth/callback') {
-    const body = (await readBody(request)) || {};
-    const key = body.apiKey || url.searchParams.get('apiKey');
-    if (!key) return json({ error: 'Missing apiKey' }, 400);
-    try {
-      const id = await provisionAccount(pool, config, key.trim(), 'Studio授权账号');
-      return json({ ok: true, id, message: '账号已成功授权并添加到号池' });
-    } catch (e) {
-      return json({ error: e.message || '添加失败' }, e.status || 500);
-    }
   }
 
   // 后续 /api 路由需要管理员鉴权

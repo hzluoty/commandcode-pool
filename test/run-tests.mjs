@@ -257,6 +257,12 @@ const browserUrlRes = await handleRequest(browserUrlReq);
 assertEq(browserUrlRes.status, 200, '/api/auth/browser-url 返回 200');
 const browserUrlJson = await browserUrlRes.json();
 assert(browserUrlJson.authUrl.includes('commandcode.ai/studio/auth/cli'), '生成合法的 Studio CLI 授权 URL');
+assert(browserUrlJson.callbackUrl.startsWith('http://127.0.0.1:'), '回调地址为 localhost');
+assert(new URL(browserUrlJson.authUrl).searchParams.get('state') === browserUrlJson.state, 'state 一致');
+
+// 已移除的无鉴权回调路由不得再写入号池
+const oldCbRes = await handleRequest(new Request('http://localhost:3000/api/auth/callback?apiKey=x'));
+assertEq(oldCbRes.status, 404, '/api/auth/callback 已移除，不再无鉴权写入');
 
 // 9. Mock 上游推理调用测试（OpenAI / Anthropic / Responses & 故障切换）
 console.log('--- 测试 Mock 上游推理调用与故障转移 ---');
