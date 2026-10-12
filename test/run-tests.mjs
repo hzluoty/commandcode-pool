@@ -16,6 +16,7 @@ try {
 import {
   safeEqual,
   maskKey,
+  sanitizeApiKey,
   generateTraceparent,
   usageBucketStart,
 } from '../lib/crypto-utils.js';
@@ -85,6 +86,7 @@ assert(safeEqual('abc', 'abc'), 'safeEqual 正确匹配');
 assert(!safeEqual('abc', 'xyz'), 'safeEqual 正确拒绝不同字符串');
 assert(!safeEqual('abc', 'abcd'), 'safeEqual 正确拒绝不同长度字符串');
 
+assertEq(sanitizeApiKey('\u001b[200~ user_abc\n\u001b[201~ '), 'user_abc', 'sanitizeApiKey 去除粘贴包装与空白');
 assertEq(maskKey('user_1234567890abcdef'), 'user_1…cdef', 'maskKey 正确打码');
 assert(generateTraceparent().startsWith('00-'), 'traceparent 格式符合 W3C 规范');
 

@@ -20,6 +20,7 @@ import {
   readBody,
   safeEqual,
   maskKey,
+  sanitizeApiKey,
   JSON_HEADERS,
 } from '../lib/crypto-utils.js';
 import { getPoolStore } from '../lib/pool-store.js';
@@ -456,7 +457,7 @@ export async function handleRequest(request) {
 
     if (pathName === '/api/accounts' && request.method === 'POST') {
       const body = (await readBody(request)) || {};
-      const key = String(body.key || '').trim();
+      const key = sanitizeApiKey(body.key);
       const label = String(body.label || '').trim();
       if (!key) return json({ error: 'Key 不能为空' }, 400);
 
