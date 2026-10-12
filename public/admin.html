@@ -682,16 +682,9 @@
       var res = await api('/api/auth/browser-url');
       if (res.authUrl) {
         window.open(res.authUrl, '_blank');
-        var pasted = prompt('授权完成后浏览器会跳转到 127.0.0.1:8976 (打不开是正常的)。\n请复制地址栏完整网址(或直接 API Key)粘贴到这里：');
-        if (!pasted) return;
-        pasted = pasted.trim();
-        var key = pasted;
-        if (/^https?:\/\//i.test(pasted)) {
-          var q = new URL(pasted).searchParams;
-          if (q.get('state') !== res.state) { alert('state 不匹配，请重新发起登录'); return; }
-          key = q.get('apiKey') || '';
-        }
-        if (!key) { alert('未找到 apiKey'); return; }
+        var key = prompt('在打开的页面点击“授权”后，会出现“复制 API 密钥”页面。\n请点“显示”复制完整密钥，粘贴到这里：');
+        if (!key || !key.trim()) return;
+        key = key.trim();
         $('add-key').value = key;
         $('add-key').focus();
       }

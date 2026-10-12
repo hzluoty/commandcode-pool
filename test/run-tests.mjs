@@ -259,6 +259,7 @@ const browserUrlJson = await browserUrlRes.json();
 assert(browserUrlJson.authUrl.includes('commandcode.ai/studio/auth/cli'), '生成合法的 Studio CLI 授权 URL');
 assert(browserUrlJson.callbackUrl.startsWith('http://127.0.0.1:'), '回调地址为 localhost');
 assert(new URL(browserUrlJson.authUrl).searchParams.get('state') === browserUrlJson.state, 'state 一致');
+assert(!new URL(browserUrlJson.authUrl).searchParams.has('mode'), '不使用 mode=redirect(密钥走 POST，页面拿不到)');
 
 // 已移除的无鉴权回调路由不得再写入号池
 const oldCbRes = await handleRequest(new Request('http://localhost:3000/api/auth/callback?apiKey=x'));

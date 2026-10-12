@@ -84,6 +84,8 @@ async function getModels(config, pool) {
 }
 
 // 客户端鉴权（API_KEYS 保护对外 /v1 接口）
+const CLI_CALLBACK_PORT = 8976;
+
 function verifyClientAuth(req, config) {
   if (!config.apiKeys || config.apiKeys.length === 0) return true;
   const authHeader = req.headers.get('authorization') || '';
@@ -433,10 +435,11 @@ export async function handleRequest(request) {
   // 浏览器辅助登录：生成 Command Code Studio 授权 URL
   if (pathName === '/api/auth/browser-url' && request.method === 'GET') {
     if (!verifyAdminAuth(request, config)) return json({ error: '未授权' }, 401);
-    // Studio 仅允许 localhost 回调：授权后浏览器会跳到本机(无监听)，由前端从地址栏 URL 中提取 apiKey
-    const callbackUrl = 'http://127.0.0.1:8976/callback';
+    // Studio 仅允许 localhost 回调；本机无监听，Studio 的 POST 会失败并自动跳到“复制 API 密钥”页(fallback)。
+    // 不能加 mode=redirect：该模式把密钥放在表单 POST 里，浏览器只会停在空白的 /callback 页。
+    const callbackUrl = `http://127.0.0.1:${CLI_CALLBACK_PORT}/callback`;
     const state = crypto.randomUUID();
-    const authUrl = `${STUDIO_BASE_URL}/studio/auth/cli?callback=${encodeURIComponent(callbackUrl)}&state=${encodeURIComponent(state)}&mode=redirect`;
+    const authUrl = `${STUDIO_BASE_URL}/studio/auth/cli?callback=${encodeURIComponent(callbackUrl)}&state=${encodeURIComponent(state)}`;
     return json({ authUrl, callbackUrl, state });
   }
 
