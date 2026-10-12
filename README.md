@@ -48,6 +48,7 @@ Referencing and integrating key architectural paradigms from:
 | `POOL_STRATEGY` | `sticky` (default, cache-friendly) or `round_robin` | `sticky` |
 | `KV_REST_API_URL` | *(Optional)* Upstash / Vercel KV URL for multi-region persistence | `https://...upstash.io` |
 | `KV_REST_API_TOKEN` | *(Optional)* Upstash / Vercel KV Token | `...` |
+| `REDIS_URL` | *(Optional)* Standard Redis connection string (Redis Cloud / Vercel Redis integration); used when the REST variables above are not both set | `rediss://default:...@host:port` |
 
 4. Click **Deploy**. Your dashboard will be live at `https://<your-project>.vercel.app/admin`.
 

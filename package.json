@@ -22,5 +22,8 @@
     "llm-proxy"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "redis": "^6.3.0"
+  }
 }

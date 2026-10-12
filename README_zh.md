@@ -48,6 +48,7 @@
 | `POOL_STRATEGY` | 调度策略：`sticky`（默认，推荐）或 `round_robin` | `sticky` |
 | `KV_REST_API_URL` | *(可选)* Vercel KV / Upstash Redis REST 地址 | `https://...upstash.io` |
 | `KV_REST_API_TOKEN` | *(可选)* Vercel KV / Upstash Redis REST 令牌 | `...` |
+| `REDIS_URL` | *(可选)* 标准 Redis 连接串（Redis Cloud / Vercel Redis 集成）；未同时配置上面两个 REST 变量时使用 | `rediss://default:...@host:port` |
 
 4. 点击 **Deploy**，部署完成后访问 `https://<你的域名>.vercel.app/admin` 即可进入管理面板。
 

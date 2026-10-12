@@ -405,7 +405,7 @@ export async function handleRequest(request) {
   // 2. 健康检查
   if (pathName === '/health') {
     const count = await pool.enabledCount();
-    return json({ ok: true, enabledAccounts: count, version: '1.0.0' });
+    return json({ ok: true, enabledAccounts: count, storage: pool.constructor.name, version: '1.0.0' });
   }
 
   // 3. 模型列表

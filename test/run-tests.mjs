@@ -43,6 +43,7 @@ import {
 } from '../lib/failure-policy.js';
 import {
   MemPool,
+  RedisPool,
   mergeQuotaState,
   rowToAccount,
 } from '../lib/pool-store.js';
@@ -268,6 +269,33 @@ const oldCbRes = await handleRequest(new Request('http://localhost:3000/api/auth
 assertEq(oldCbRes.status, 404, '/api/auth/callback 已移除，不再无鉴权写入');
 
 // 9. Mock 上游推理调用测试（OpenAI / Anthropic / Responses & 故障切换）
+console.log('--- 测试 RedisPool (内存假 Redis 客户端) ---');
+{
+  const store = new Map(); // key -> Map(field -> value) | number
+  const fake = {
+    async sendCommand(argv) {
+      const [cmd, key, ...rest] = argv;
+      assert(argv.every((a) => typeof a === 'string'), 'RedisPool 命令参数全部为字符串');
+      if (cmd === 'INCR') { const n = (store.get(key) || 0) + 1; store.set(key, n); return n; }
+      if (cmd === 'EXPIRE') return 1;
+      const h = store.get(key) || new Map();
+      if (cmd === 'HSET') { h.set(rest[0], rest[1]); store.set(key, h); return 1; }
+      if (cmd === 'HGET') return h.get(rest[0]) ?? null;
+      if (cmd === 'HDEL') return h.delete(rest[0]) ? 1 : 0;
+      if (cmd === 'HGETALL') return [...h].flat();
+      throw new Error('unexpected command ' + cmd);
+    },
+  };
+  const rp = new RedisPool('redis://unused', 8, fake);
+  const rid = await rp.add('user_redis_test_key_0001', 'redis-1');
+  assertEq((await rp.list()).length, 1, 'RedisPool add/list');
+  assertEq((await rp.getRaw(rid)).api_key, 'user_redis_test_key_0001', 'RedisPool getRaw');
+  await rp.patch(rid, { enabled: false });
+  assertEq((await rp.list())[0].enabled, false, 'RedisPool patch');
+  await rp.remove(rid);
+  assertEq((await rp.list()).length, 0, 'RedisPool remove');
+}
+
 console.log('--- 测试 Mock 上游推理调用与故障转移 ---');
 
 const origFetch = globalThis.fetch;
