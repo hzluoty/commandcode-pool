@@ -117,7 +117,9 @@ The dashboard at `/admin` and the API at `/api/usage/daily` track both upstream 
    - **Credit Balances**: Monthly remaining, purchased, and free credits.
 2. **Pool Consumption**:
    - Request counts, prompt tokens, completion tokens, and cache-read tokens.
-   - Interactive breakdown charts across `5m`, `1h`, `5h`, `1d`, `3d`, `7d`, and `30d`.
+   - Interactive breakdown charts across `5m`, `1h`, `5h`, `1d`, `3d`, and `7d`. Removed `30d` queries fall back to `1d`.
+   - Redis usage buckets expire after the maximum query window plus one day (currently 8 days). Existing buckets keep their original TTL; account keys and lifetime totals are not deleted.
+   - Reads use bounded pipelines of 256 buckets. Writes atomically merge JSON counters and metadata without changing the stored format.
 
 ---
 
@@ -129,6 +131,9 @@ node api/index.js
 
 # Run full test suite
 node test/run-tests.mjs
+
+# Optional real-Redis integration test: start an EMPTY disposable local Redis first
+node test/redis-integration.mjs redis://127.0.0.1:16379
 ```
 
 ---

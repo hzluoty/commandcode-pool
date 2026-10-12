@@ -117,7 +117,9 @@ curl https://<你的域名>.vercel.app/v1/messages \
    - **余额状态**：月度剩余、充值余额、免费额度。
 2. **号池网关用量**：
    - 累计请求数、Prompt Tokens、Completion Tokens、Cache Read Tokens；
-   - 聚合时序图表：支持按 `5m`、`1h`、`5h`、`1d`、`3d`、`7d`、`30d` 查看调用趋势与缓存命中率。
+   - 聚合时序图表：支持按 `5m`、`1h`、`5h`、`1d`、`3d`、`7d` 查看调用趋势与缓存命中率。旧 `30d` 请求降级为 `1d`。
+   - Redis 用量桶按最大查询范围加一天余量过期（当前为 8 天）；已有桶保持原 TTL，不删除账号键和累计用量。
+   - 读取每批最多 256 个桶，通过 pipeline 批量传输；计数和元数据在 Redis 中原子合并，保持原 JSON 存储格式。
 
 ---
 
@@ -129,6 +131,9 @@ node api/index.js
 
 # 运行自动化测试套件
 node test/run-tests.mjs
+
+# 可选真实 Redis 集成测试：先启动空的、可丢弃的本机测试 Redis
+node test/redis-integration.mjs redis://127.0.0.1:16379
 ```
 
 ---

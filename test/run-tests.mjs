@@ -6,6 +6,9 @@ import {
   KNOWN_PLANS,
   planInfo,
   CC_PROTOCOL_VERSION,
+  USAGE_RANGES,
+  MAX_USAGE_RANGE_SECONDS,
+  USAGE_RETENTION_SECONDS,
 } from '../lib/constants.js';
 
 // 清理测试临时数据
@@ -44,6 +47,8 @@ import {
 import {
   MemPool,
   RedisPool,
+  UpstashKvPool,
+  normalizeUsageRange,
   mergeQuotaState,
   rowToAccount,
 } from '../lib/pool-store.js';
@@ -81,6 +86,19 @@ const goatPlan = planInfo('individual-goat');
 assertEq(goatPlan.name, 'GOAT', 'GOAT 套餐名称为 GOAT');
 assertEq(goatPlan.monthlyCredits, 70, 'GOAT 套餐月度额度为 70');
 assertEq(goatPlan.isGoPlan, false, 'GOAT 套餐 isGoPlan 为 false');
+
+assert(!USAGE_RANGES['30d'], '移除 30 天用量范围');
+assertEq(MAX_USAGE_RANGE_SECONDS, 7 * 86400, '最大用量范围为 7 天');
+assertEq(USAGE_RETENTION_SECONDS, MAX_USAGE_RANGE_SECONDS + 86400, '保留时间随最大查询范围计算');
+assertEq(normalizeUsageRange('30d').key, '1d', '旧 30d 查询降级为 1d');
+assertEq(normalizeUsageRange('90').key, '1d', '超长数字范围降级为 1d');
+assertEq(normalizeUsageRange('7').key, '7d', '保留数字天数兼容');
+assertEq(normalizeUsageRange('2d').seconds, 2 * 86400, '保留范围内自定义天数');
+assertEq(normalizeUsageRange('5garbage').key, '1d', '拒绝不完整的天数格式');
+assertEq(normalizeUsageRange('constructor').key, '1d', '范围名称不得命中对象原型属性');
+assertEq(normalizeUsageRange({ key: '30d', seconds: 30 * 86400 }).key, '1d', '对象不能绕过最大范围限制');
+assertEq(normalizeUsageRange({ key: '7d', seconds: Infinity }).seconds, MAX_USAGE_RANGE_SECONDS, '对象范围使用服务端定义');
+assert(!fs.readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8').includes('data-range="30d"'), '管理页移除 30 天按钮');
 
 // 2. Crypto Utils
 assert(safeEqual('abc', 'abc'), 'safeEqual 正确匹配');
@@ -238,6 +256,10 @@ assertEq(healthRes.status, 200, '/health 返回 200');
 const healthJson = await healthRes.json();
 assertEq(healthJson.ok, true, '/health ok 字段为 true');
 
+const legacyUsageRes = await handleRequest(new Request('http://localhost:3000/api/usage/daily?range=30d'));
+assertEq(legacyUsageRes.status, 200, '旧 30d API 查询正常返回');
+assertEq(await legacyUsageRes.json(), await pool.dailyUsage('1d'), '旧 30d API 查询降级为 1d');
+
 // 测试 /v1/models
 const modelsReq = new Request('http://localhost:3000/v1/models');
 const modelsRes = await handleRequest(modelsReq);
@@ -272,12 +294,21 @@ assertEq(oldCbRes.status, 404, '/api/auth/callback 已移除，不再无鉴权�
 console.log('--- 测试 RedisPool (内存假 Redis 客户端) ---');
 {
   const store = new Map(); // key -> Map(field -> value) | number
+  const calls = [];
+  const batches = [];
   const fake = {
     async sendCommand(argv) {
       const [cmd, key, ...rest] = argv;
-      assert(argv.every((a) => typeof a === 'string'), 'RedisPool 命令参数全部为字符串');
+      calls.push(argv);
       if (cmd === 'INCR') { const n = (store.get(key) || 0) + 1; store.set(key, n); return n; }
       if (cmd === 'EXPIRE') return 1;
+      if (cmd === 'EVAL') {
+        const hash = store.get(argv[3]);
+        const previous = hash?.get(argv[4]);
+        if (!previous) return 0;
+        hash.set(argv[4], JSON.stringify({ ...JSON.parse(previous), ...JSON.parse(argv[5]) }));
+        return 1;
+      }
       const h = store.get(key) || new Map();
       if (cmd === 'HSET') { h.set(rest[0], rest[1]); store.set(key, h); return 1; }
       if (cmd === 'HGET') return h.get(rest[0]) ?? null;
@@ -285,15 +316,76 @@ console.log('--- 测试 RedisPool (内存假 Redis 客户端) ---');
       if (cmd === 'HGETALL') return [...h].flat();
       throw new Error('unexpected command ' + cmd);
     },
+    multi() {
+      const commands = [];
+      return {
+        sendCommand(argv) { commands.push(argv); return this; },
+        execAsPipeline() {
+          batches.push(commands);
+          return Promise.all(commands.map(argv => fake.sendCommand(argv)));
+        },
+      };
+    },
   };
   const rp = new RedisPool('redis://unused', 8, fake);
   const rid = await rp.add('user_redis_test_key_0001', 'redis-1');
   assertEq((await rp.list()).length, 1, 'RedisPool add/list');
   assertEq((await rp.getRaw(rid)).api_key, 'user_redis_test_key_0001', 'RedisPool getRaw');
+  const testBucket = usageBucketStart(Date.now(), 8);
+  store.set(`cc_pool:bucket:${testBucket}`, new Map([[String(rid), JSON.stringify({ requests: 2, prompt_tokens: 10 })]]));
+  store.set(`cc_pool:bucket:${testBucket - 86400}`, new Map([[String(rid), JSON.stringify({ requests: 3, completion_tokens: 8 })]]));
+  const redisUsage = await rp.dailyUsage('7d');
+  assertEq(redisUsage.totals, { requests: 5, promptTokens: 10, completionTokens: 8, cacheReadTokens: 0 }, 'Redis pipeline 保留桶与账号的聚合结果');
+  assertEq(batches.map(batch => batch.length), [256, 256, 256, 256, 256, 256, 256, 224], '7d 使用 8 个有界 pipeline，而非 2016 次串行往返');
+  assertEq(await rp.cmdMany([]), [], 'Redis 空 pipeline 不发命令');
+  await rp.cmdMany([['HGET', 'cc_pool:accounts', rid]]);
+  assert(calls.every(argv => argv.every(arg => typeof arg === 'string')), 'Redis 单条与批量命令参数全部为字符串');
   await rp.patch(rid, { enabled: false });
   assertEq((await rp.list())[0].enabled, false, 'RedisPool patch');
+  await rp.patch(rid, { label: 'renamed', enabled: true });
+  await rp.cooldown(rid, 30, 'slow down');
+  await rp.disable(rid, 'disabled');
+  await rp.markQuotaError(rid, 'refresh failed');
+  const metadata = await rp.getRaw(rid);
+  assertEq(metadata.label, 'renamed', '元数据更新保留其他字段');
+  assertEq(metadata.last_error, 'refresh failed', '元数据通过部分合并更新');
+  assertEq(metadata.disabled_reason, 'disabled', '停用原因保留');
+  assert(metadata.rate_limited_until > Date.now(), '冷却时间写入');
+  assertEq(await rp.patch(999, { label: 'missing' }), false, '部分合并不得创建已删除账号');
   await rp.remove(rid);
   assertEq((await rp.list()).length, 0, 'RedisPool remove');
+}
+
+console.log('--- 测试 Upstash REST pipeline ---');
+{
+  const savedFetch = globalThis.fetch;
+  const calls = [];
+  let errorBody = null;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), commands: JSON.parse(options.body), headers: options.headers });
+    const commands = JSON.parse(options.body);
+    const body = errorBody || commands.map((_, i) => ({ result: i === 0 ? ['1', JSON.stringify({ requests: 4 })] : null }));
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+  try {
+    const kv = new UpstashKvPool('https://test.invalid/', 'test-token');
+    const result = await kv.cmdMany([['HGETALL', 'bucket:1'], ['HGETALL', 'bucket:2']]);
+    assertEq(result, [['1', JSON.stringify({ requests: 4 })], null], 'REST pipeline 按原顺序返回结果');
+    assertEq(calls[0].url, 'https://test.invalid/pipeline', 'REST 使用 /pipeline');
+    assertEq(calls[0].headers.Authorization, 'Bearer test-token', 'REST pipeline 保留鉴权');
+    assertEq(await kv.cmdMany([]), [], 'REST 空 pipeline 不发请求');
+    assertEq(calls.length, 1, 'REST 批量命令只有一次 HTTP 请求');
+    errorBody = [{ result: [] }, { error: 'WRONGTYPE' }];
+    let error;
+    try { await kv.cmdMany([['HGETALL', 'bucket:1'], ['HGETALL', 'bucket:2']]); } catch (e) { error = e; }
+    assert(error?.message.includes('WRONGTYPE'), 'REST pipeline 命令错误不得静默丢失');
+    errorBody = { error: 'ERR script failed' };
+    error = null;
+    try { await kv.cmd('EVAL', 'test script', 0); } catch (e) { error = e; }
+    assert(error?.message.includes('script failed'), 'REST 单条命令错误不得静默丢失');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 }
 
 console.log('--- 测试 Mock 上游推理调用与故障转移 ---');
