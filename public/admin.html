@@ -227,7 +227,7 @@
       <button id="tabbtn-test" type="button">在线测试</button>
     </nav>
     <div class="spacer"></div>
-    <label class="check"><input type="checkbox" id="auto-refresh"> 自动刷新</label>
+    <span class="muted small">5 秒自动刷新</span>
     <button class="btn small" id="refresh-all" type="button">全部刷新</button>
     <button class="btn small" id="logout" type="button">退出</button>
   </div></header>
@@ -370,7 +370,7 @@
   var curTab = 'quota';
   var expandedAcc = new Set();
   var expandedDay = new Set();
-  var autoTimer = null;
+  var autoRefreshing = false;
 
   function setView(view) {
     $('view-login').style.display = view === 'login' ? 'block' : 'none';
@@ -644,15 +644,13 @@
     }
   });
 
-  $('auto-refresh').addEventListener('change', function () {
-    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
-    if (this.checked) {
-      autoTimer = setInterval(function () {
-        loadQuota();
-        if (curTab === 'usage') loadDaily();
-      }, 30000);
-    }
-  });
+  // 固定 5 秒自动刷新当前标签的数据；上一次未完成时跳过本轮。
+  setInterval(function () {
+    if (autoRefreshing || $('view-app').style.display === 'none') return;
+    autoRefreshing = true;
+    // 返回 Promise 便于测试等待；浏览器 setInterval 会忽略返回值。
+    return (curTab === 'usage' ? loadDaily() : loadQuota()).finally(function () { autoRefreshing = false; });
+  }, 5000);
 
   $('add-toggle').addEventListener('click', function () {
     var f = $('add-form');

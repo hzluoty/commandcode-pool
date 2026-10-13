@@ -122,7 +122,7 @@ The dashboard at `/admin` and the API at `/api/usage/daily` track both upstream 
    - Redis usage buckets expire after the maximum query window plus one day (currently 8 days). Existing buckets keep their original TTL; account keys and lifetime totals are not deleted.
    - Reads use bounded pipelines of 256 buckets. Writes atomically merge JSON counters and metadata without changing the stored format.
    - Only fully completed gateway requests count as successes. A `finish-step` alone is not a completed request; upstream errors, truncated streams, and entirely empty responses are not counted. Real text, reasoning, or tool output is accepted even without usage. Tokens come only from upstream reports: missing fields count as 0, chunk counts are not estimates, and zero output tokens do not erase reported input/cache tokens. Streaming usage is saved before successful terminal frames are sent.
-   - Refresh All and completed Playground calls reload both accounts and usage without caching. The Playground separates the answer from collapsible reasoning and displays the requested model, tokens, and elapsed time (the requested model does not independently verify upstream model identity).
+   - The console refreshes the visible tab every 5 seconds; Refresh All and completed Playground calls reload both accounts and usage without caching. The Playground separates the answer from collapsible reasoning and displays the requested model, tokens, and elapsed time (the requested model does not independently verify upstream model identity).
 
 ### Troubleshooting usage on Vercel
 

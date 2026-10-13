@@ -568,9 +568,11 @@ assertEq(anthropicCallJson.content[0].text, 'Hello, CommandCode Go!', 'Anthropic
     document.getElementById('test-model').value = testBody.model;
     document.getElementById('test-prompt').value = 'Hi';
     const browserRequests = [];
+    const timers = [];
     const context = vm.createContext({
       document, TextDecoder,
       localStorage: { getItem: () => adminToken }, sessionStorage: { getItem: () => null },
+      setInterval: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
       fetch: (endpoint, options) => {
         browserRequests.push({ endpoint, options });
         if (endpoint === '/api/refresh') return Promise.resolve(new Response('{"ok":true}'));
@@ -604,6 +606,18 @@ assertEq(anthropicCallJson.content[0].text, 'Hello, CommandCode Go!', 'Anthropic
     const beforeRefresh = browserRequests.length;
     await refreshButton.listeners.click.call(refreshButton);
     assert(browserRequests.slice(beforeRefresh).some(r => r.endpoint.startsWith('/api/usage/daily')), '全部刷新必须刷新用量统计');
+
+    // 自动刷新固定在 5 秒，且跟随当前标签。
+    assertEq(timers.map(t => t.ms), [5000], '仅注册一个 5 秒自动刷新定时器');
+    const autoRefresh = timers[0].fn;
+    const beforeAuto = browserRequests.length;
+    await autoRefresh();
+    assert(browserRequests.slice(beforeAuto).every(r => r.endpoint.startsWith('/api/accounts')), '额度标签自动刷新账号');
+    document.getElementById('tabbtn-usage').listeners.click.call(document.getElementById('tabbtn-usage'));
+    await Promise.resolve();
+    const beforeUsageAuto = browserRequests.length;
+    await autoRefresh();
+    assert(browserRequests.slice(beforeUsageAuto).some(r => r.endpoint.startsWith('/api/usage/daily')), '用量标签自动刷新用量统计');
 
     mockResponses = [new Response('{"type":"text-delta","text":"Partial"}\n')];
     await sendButton.listeners.click.call(sendButton);
