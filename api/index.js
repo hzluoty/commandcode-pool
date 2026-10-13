@@ -37,10 +37,6 @@ import {
   collectedUsageOpenAI,
   buildAnthropicResponse,
   mapCcError,
-  mapCcEventError,
-  zeroOutputError,
-  idleTimeoutError,
-  transportError,
 } from '../lib/api-adapters.js';
 import {
   evaluateAccountAction,
@@ -204,7 +200,6 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
       const upstreamReader = upstreamResp.body.getReader();
       const decoder = new TextDecoder();
       let streamBuffer = '';
-      let firstChunkSent = false;
 
       const readable = new ReadableStream({
         async start(controller) {
@@ -212,7 +207,11 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
           const send = (str) => {
             if (!str) return;
             controller.enqueue(enc.encode(str));
-            firstChunkSent = true;
+          };
+          const translate = async (line) => {
+            const translated = await translator.parseLine(line);
+            if (Array.isArray(translated)) translated.forEach(send);
+            else send(translated);
           };
 
           if (typeof translator.preamble === 'function') {
@@ -230,30 +229,35 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
                 const line = streamBuffer.slice(0, idx).trim();
                 streamBuffer = streamBuffer.slice(idx + 1);
                 if (!line) continue;
-                const translated = await translator.parseLine(line);
-                if (translated) {
-                  if (Array.isArray(translated)) translated.forEach(send);
-                  else send(translated);
-                }
+                await translate(line);
               }
             }
 
-            // 收尾
-            if (typeof translator.finalize === 'function') {
-              const fin = await translator.finalize();
-              if (Array.isArray(fin)) fin.forEach(send);
-              else if (fin) send(fin);
-            }
-            if (typeof translator.getDoneEvent === 'function') {
-              send(translator.getDoneEvent());
+            streamBuffer += decoder.decode();
+            if (streamBuffer.trim()) await translate(streamBuffer.trim());
+
+            const streamError = translator.completionError();
+            if (streamError) {
+              const action = evaluateAccountAction(streamError.reportedStatus || streamError.status);
+              if (action.action === 'disable') await pool.disable(account.id, action.reason);
+              else if (action.action === 'cooldown') await pool.cooldown(account.id, action.seconds, action.message);
+              send(translator.errorEvent(streamError));
+              controller.close();
+              return;
             }
 
-            // 成功记录用量
+            // 先落库再发完成帧，SDK 收到终止标记即断开也不会漏计。
             await pool.recordSuccess(account.id, {
               prompt_tokens: translator.inputTokens || 0,
               completion_tokens: translator.outputTokens || 0,
               prompt_tokens_details: { cached_tokens: translator.cachedInputTokens || 0 },
             });
+            if (typeof translator.finalize === 'function') {
+              const fin = await translator.finalize();
+              if (Array.isArray(fin)) fin.forEach(send);
+              else send(fin);
+            }
+            if (typeof translator.getDoneEvent === 'function') send(translator.getDoneEvent());
             controller.close();
           } catch (streamErr) {
             controller.error(streamErr);
@@ -281,21 +285,17 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
     // ── 非流式响应分支 ──
     const collected = await collectCcStream(upstreamResp);
 
-    if (collected.upstreamError) {
-      const errAction = evaluateAccountAction(collected.upstreamError.reportedStatus || collected.upstreamError.status);
-      if (errAction.action === 'cooldown' || errAction.action === 'disable') {
-        if (errAction.action === 'disable') await pool.disable(account.id, errAction.reason);
-        else await pool.cooldown(account.id, errAction.seconds, errAction.message);
+    if (collected.completionError) {
+      const error = collected.completionError;
+      const action = evaluateAccountAction(error.reportedStatus || error.status);
+      if (action.action === 'cooldown' || action.action === 'disable') {
+        if (action.action === 'disable') await pool.disable(account.id, action.reason);
+        else await pool.cooldown(account.id, action.seconds, action.message);
         excludeIds.push(account.id);
         continue;
       }
-      return json(collected.upstreamError.body, collected.upstreamError.status);
-    }
-
-    if (!collected.sawFinish && collected.finishReason === 'upstream_error') {
-      await pool.cooldown(account.id, 10, '上游提前断开');
-      excludeIds.push(account.id);
-      continue;
+      const mapped = mapClientError(kind, error.status, error.body.error.message, error.body.error.type, error.retryAfter);
+      return json(mapped.body, mapped.status, mapped.headers);
     }
 
     const usage = collectedUsageOpenAI(collected.usage);
@@ -556,7 +556,12 @@ export default async function handler(req, res) {
     }
 
     const abortController = new AbortController();
-    req.on('close', () => abortController.abort());
+    req.on('close', () => {
+      if (!req.complete) abortController.abort();
+    });
+    res.on('close', () => {
+      if (!res.writableFinished) abortController.abort();
+    });
 
     let body = null;
     if (req.method !== 'GET' && req.method !== 'HEAD') {

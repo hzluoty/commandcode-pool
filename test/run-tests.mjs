@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
+import http from 'node:http';
 import {
   KNOWN_PLANS,
   planInfo,
@@ -39,6 +40,7 @@ import {
   mapCcError,
   mapCcEventError,
   fakeThinkingSignature,
+  collectCcStream,
 } from '../lib/api-adapters.js';
 import {
   evaluateAccountAction,
@@ -53,7 +55,7 @@ import {
   mergeQuotaState,
   rowToAccount,
 } from '../lib/pool-store.js';
-import { handleRequest } from '../api/index.js';
+import handler, { handleRequest } from '../api/index.js';
 
 let passed = 0;
 let failed = 0;
@@ -185,12 +187,38 @@ const chunk1 = sseTranslator.parseLine('{"type":"text-delta","text":"Hello"}');
 assert(chunk1 && chunk1[0].includes('chat.completion.chunk'), 'OpenAI SSE 翻译产出正确 chunk 格式');
 assert(chunk1[0].includes('Hello'), 'OpenAI SSE chunk 包含内容');
 
-const finishChunk = sseTranslator.parseLine('{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":10,"outputTokens":5}}');
-assert(finishChunk && finishChunk[0].includes('finish_reason'), 'OpenAI SSE 正确产出 finish chunk');
+assertEq(sseTranslator.parseLine('{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":10,"outputTokens":5}}'), null, 'OpenAI 完成帧暂存，不在 parseLine 提前发送');
+assert(sseTranslator.finalize().includes('finish_reason'), 'OpenAI finalize 产出完成帧');
 
 // Anthropic SSE 翻译器测试
 const anthropicTranslator = createAnthropicSseTranslator('claude-3-5-sonnet', 'msg-test');
 assert(anthropicTranslator.preamble().includes('message_start'), 'Anthropic SSE 产出 message_start 前导帧');
+
+// 完成帧用量不能依赖末尾换行或旧 finish-step 快照。
+const usageEvent = { type: 'finish', finishReason: 'stop', usage: { inputTokens: 31, outputTokens: 12, cachedInputTokens: 7 } };
+// 旧步骤快照不得泄漏进最终用量（含缓存细分），三种协议一致。
+const stepSnapshot = {
+  type: 'finish-step',
+  usage: { inputTokens: 100, outputTokens: 20, cachedInputTokens: 70, inputTokenDetails: { noCacheTokens: 30, cacheWriteTokens: 10 } },
+};
+for (const translator of [createSseTranslator('model', 'id', 1), createAnthropicSseTranslator('model', 'id'), createResponsesSseTranslator('model', 'id', 1)]) {
+  await translator.parseLine(JSON.stringify(stepSnapshot));
+  await translator.parseLine(JSON.stringify(usageEvent));
+  assertEq([translator.inputTokens, translator.outputTokens, translator.cachedInputTokens], [31, 12, 7], 'finish.usage 整份替换旧 step 用量');
+}
+const stepLeaked = await collectCcStream(new Response(JSON.stringify(stepSnapshot) + '\n' + JSON.stringify(usageEvent)));
+assertEq(stepLeaked.usage, usageEvent.usage, '非流式最终用量整份替换旧 step 快照');
+const stepOnlyUsage = await collectCcStream(new Response(JSON.stringify(stepSnapshot)));
+assertEq(stepOnlyUsage.usage, stepSnapshot.usage, '最终无 usage 时才回退步骤快照');
+const noNewlineCollected = await collectCcStream(new Response('{"type":"text-delta","text":"Hello"}\n' + JSON.stringify(usageEvent)));
+assertEq(noNewlineCollected.usage, usageEvent.usage, '非流式解析末尾无换行的用量帧');
+assertEq(noNewlineCollected.sawFinish, true, '无末尾换行仍识别完成事件');
+const stepOnly = { type: 'finish-step', finishReason: 'stop', usage: usageEvent.usage };
+for (const translator of [createSseTranslator('model', 'id', 1), createAnthropicSseTranslator('model', 'id'), createResponsesSseTranslator('model', 'id', 1)]) {
+  await translator.parseLine(JSON.stringify(stepOnly));
+  assertEq(translator.incompleteDetail(), 'no finish event', '步骤完成不代表整体请求完成');
+}
+assertEq((await collectCcStream(new Response(JSON.stringify(stepOnly)))).sawFinish, false, '非流式仅步骤完成的截断不得统计成功');
 
 // 6. 错误映射与健康管理 (Failure Policy)
 const retryHeaders = new Headers({ 'retry-after': '45' });
@@ -248,6 +276,7 @@ assertEq(usedAcct.usage.requests, 1, '网关累计请求计数累加成功');
 assertEq(usedAcct.usage.promptTokens, 150, '网关输入 token 记录正确');
 assertEq(usedAcct.usage.completionTokens, 30, '网关输出 token 记录正确');
 assertEq(usedAcct.usage.cacheReadTokens, 100, '网关缓存命中 token 记录正确');
+assertEq((await new MemPool([], 0).dailyUsage('1d')).tzOffset, 0, '用量接口返回真实 UTC 时区偏移');
 
 // 调度策略测试 (Sticky 优先选择最近使用的账号)
 const pickedSticky = await pool.pick('sticky');
@@ -544,6 +573,7 @@ assertEq(anthropicCallJson.content[0].text, 'Hello, CommandCode Go!', 'Anthropic
       localStorage: { getItem: () => adminToken }, sessionStorage: { getItem: () => null },
       fetch: (endpoint, options) => {
         browserRequests.push({ endpoint, options });
+        if (endpoint === '/api/refresh') return Promise.resolve(new Response('{"ok":true}'));
         return handleRequest(new Request(`http://localhost:3000${endpoint}`, options));
       },
     });
@@ -552,14 +582,36 @@ assertEq(anthropicCallJson.content[0].text, 'Hello, CommandCode Go!', 'Anthropic
     const sendButton = document.getElementById('test-send-btn');
     for (const stream of [false, true]) {
       document.getElementById('test-stream').checked = stream;
+      mockResponses = [new Response([
+        { type: 'reasoning-delta', text: '思考一' }, { type: 'reasoning-delta', text: '思考二' },
+        { type: 'text-delta', text: 'Hello, CommandCode Go!' }, usageEvent,
+      ].map(event => JSON.stringify(event)).join('\n'))];
       await sendButton.listeners.click.call(sendButton);
       const sent = browserRequests.filter(r => JSON.parse(r.options.body || '{}').messages).at(-1);
       assertEq(sent.endpoint, '/api/test', '管理页按钮走管理测试入口');
       assertEq(sent.options.headers['X-Admin-Token'], adminToken, '管理页按钮发送现有管理员凭据');
       assert(!JSON.stringify(sent).includes(clientKey), '管理页不获取或发送 API_KEYS');
-      assert(document.getElementById('test-result').textContent.includes('Hello, CommandCode Go!'), '实际管理页显示模型响应');
+      const output = document.getElementById('test-result').textContent;
+      assert(output.includes('Hello, CommandCode Go!'), '实际管理页显示模型响应');
+      assert(!output.includes('思考一') && !output.includes('思考二'), '思考不挤占正文输出');
+      assertEq(document.getElementById('test-reasoning').textContent, '思考一思考二', '思考增量连续拼接到独立区域');
+      assert(output.includes('[请求模型] ' + testBody.model), '显示请求模型而非依赖模型自报身份');
+      assert(output.includes('Prompt: 31') && output.includes('Completion: 12'), '两种在线测试都显示准确 Tokens');
+      assert(browserRequests.some(r => r.endpoint.startsWith('/api/usage/daily')), '在线测试结束刷新用量');
       assertEq(sendButton.disabled, false, '管理测试结束后按钮恢复');
     }
+    const refreshButton = document.getElementById('refresh-all');
+    const beforeRefresh = browserRequests.length;
+    await refreshButton.listeners.click.call(refreshButton);
+    assert(browserRequests.slice(beforeRefresh).some(r => r.endpoint.startsWith('/api/usage/daily')), '全部刷新必须刷新用量统计');
+
+    mockResponses = [new Response('{"type":"text-delta","text":"Partial"}\n')];
+    await sendButton.listeners.click.call(sendButton);
+    assert(document.getElementById('test-result').textContent.includes('❌'), '不完整 SSE 不显示完成');
+    assert(!document.getElementById('test-result').textContent.includes('✓ 完成'), '缺少完成帧不伪报成功');
+    await pool.patch(acctId, { enabled: true });
+    // 不完整流会冷却账号，恢复测试账号以隔离后续用例。
+    await pool.cooldown(acctId, 0);
 
     delete process.env.ADMIN_TOKEN;
     const before = wireRequests.length;
@@ -577,6 +629,157 @@ assertEq(anthropicCallJson.content[0].text, 'Hello, CommandCode Go!', 'Anthropic
       else process.env[name] = value;
     }
   }
+}
+
+// Vercel/Node 真实 HTTP 适配器：请求体读完不是客户端断开。
+{
+  const server = http.createServer((req, res) => handler(req, res));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    for (const stream of [false, true]) {
+      const before = (await pool.getRaw(acctId)).requests;
+      mockResponses = [async (url, options) => {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        if (options.signal?.aborted) throw new DOMException('Request was aborted', 'AbortError');
+        return new Response('{"type":"text-delta","text":"HTTP works"}\n' + JSON.stringify(usageEvent));
+      }];
+      const response = await origFetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'Hi' }], stream }),
+      });
+      assertEq(response.status, 200, '真实 HTTP 请求体读完不误取消上游');
+      assert((await response.text()).includes('HTTP works'), 'Node HTTP 适配器返回完整内容');
+      assertEq((await pool.getRaw(acctId)).requests, before + 1, '真实 HTTP 调用成功记录用量');
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+}
+
+// 成功终止帧必须等持久化完成，防止 SDK 收到完成标记后断开导致漏计。
+for (const [endpoint, body, terminal] of [
+  ['/v1/chat/completions', { messages: [{ role: 'user', content: 'Hi' }] }, '[DONE]'],
+  ['/v1/messages', { messages: [{ role: 'user', content: 'Hi' }], max_tokens: 1024 }, 'event: message_stop'],
+  ['/v1/responses', { input: 'Hi' }, 'event: response.completed'],
+]) {
+  const before = (await pool.getRaw(acctId)).requests;
+  const originalRecord = pool.recordSuccess;
+  let release, notify;
+  const gate = new Promise(resolve => { release = resolve; });
+  const recording = new Promise(resolve => { notify = resolve; });
+  pool.recordSuccess = async function (id, usage) {
+    notify();
+    await gate;
+    return originalRecord.call(this, id, usage);
+  };
+  let received = '';
+  try {
+    const response = await handleRequest(new Request('http://localhost:3000' + endpoint, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, stream: true }),
+    }));
+    const reader = response.body.getReader();
+    const consuming = (async () => {
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += decoder.decode(value, { stream: true });
+      }
+    })();
+    await recording;
+    await new Promise(resolve => setImmediate(resolve));
+    assert(!received.includes(terminal), '持久化完成前不发协议成功结束标记');
+    assert(!received.includes('"finish_reason":"stop"'), '持久化完成前不发 OpenAI 完成帧');
+    release();
+    await consuming;
+    assert(received.includes(terminal), '持久化完成后才结束 SSE');
+    assertEq((await pool.getRaw(acctId)).requests, before + 1, '流式调用仅计一次成功');
+  } finally {
+    release();
+    pool.recordSuccess = originalRecord;
+  }
+}
+
+// 三种协议、两种输出方式共用成功规则：实际正文/思考/工具输出与整体 finish 缺一不可。
+for (const [endpoint, body, terminal] of [
+  ['/v1/chat/completions', { messages: [{ role: 'user', content: 'Hi' }] }, '[DONE]'],
+  ['/v1/messages', { messages: [{ role: 'user', content: 'Hi' }], max_tokens: 1024 }, 'event: message_stop'],
+  ['/v1/responses', { input: 'Hi' }, 'event: response.completed'],
+]) {
+  for (const stream of [false, true]) {
+    for (const [events, success] of [
+      [[{ type: 'finish', finishReason: 'stop', usage: { inputTokens: 0, outputTokens: 0 } }], false],
+      [[{ type: 'finish', finishReason: 'stop' }], false],
+      [[{ type: 'text-delta', text: 'Partial' }, stepOnly], false],
+      [[{ type: 'text-delta', text: 'No usage provided' }, { type: 'finish', finishReason: 'stop' }], true],
+      [[{ type: 'reasoning-delta', text: 'Thinking only' }, { type: 'finish', finishReason: 'stop' }], true],
+      [[{ type: 'tool-call', toolCallId: 'call_test', toolName: 'read_file', input: { path: 'test.txt' } }, { type: 'finish', finishReason: 'tool_calls' }], true],
+      ...['text-delta', 'reasoning-delta', 'tool-call'].map(type => [[
+        { type, text: 'Explicit zero usage but real output', toolCallId: 'call_zero', toolName: 'read_file', input: {} },
+        { type: 'finish', finishReason: type === 'tool-call' ? 'tool_calls' : 'stop', usage: { inputTokens: 31, outputTokens: 0, cachedInputTokens: 7 } },
+      ], true]),
+      [[{ type: 'text-delta', text: 'Input usage without output count' }, { type: 'finish', usage: { inputTokens: 31, cachedInputTokens: 7 } }], true],
+      [[{ type: 'text-delta', text: 'Multiple' }, { type: 'text-delta', text: 'chunks' }, { type: 'finish', finishReason: 'stop' }], true],
+    ]) {
+      const beforeAccount = (await pool.list()).find(a => a.id === acctId).usage;
+      const beforeTotals = (await pool.dailyUsage('1d')).totals;
+      const before = beforeAccount.requests;
+      mockResponses = [new Response(events.map(event => JSON.stringify(event)).join('\n'))];
+      const response = await handleRequest(new Request('http://localhost:3000' + endpoint, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, stream }),
+      }));
+      const text = await response.text();
+      assertEq(response.status, stream || success ? 200 : 429, `${endpoint} ${stream ? '流式' : '非流式'} 完成规则一致`);
+      const hasError = stream ? /(?:event: error|data: \{"error":)/.test(text) : !!JSON.parse(text).error;
+      assertEq(hasError, !success, '空响应/步骤截断报错，有实际输出但缺用量仍合法');
+      assert(!stream || text.includes(terminal) === success, '失败不发送协议成功结束帧');
+      assertEq((await pool.getRaw(acctId)).requests, before + Number(success), '跨协议成功计数与完成规则一致');
+      const reported = success ? events.at(-1).usage || {} : {};
+      const expectedIncrement = [Number(success), reported.inputTokens ?? 0, reported.outputTokens ?? 0, reported.cachedInputTokens ?? 0];
+      const afterAccount = (await pool.list()).find(a => a.id === acctId).usage;
+      const afterTotals = (await pool.dailyUsage('1d')).totals;
+      const fields = ['requests', 'promptTokens', 'completionTokens', 'cacheReadTokens'];
+      assertEq(fields.map(f => afterAccount[f] - beforeAccount[f]), expectedIncrement, '跨协议账号只保存上游实际用量，不估算或抹掉输入缓存');
+      assertEq(fields.map(f => afterTotals[f] - beforeTotals[f]), expectedIncrement, '统计桶用量与账号增量一致');
+      if (success && endpoint === '/v1/messages') {
+        const anthropicUsage = stream
+          ? text.split('\n').filter(line => line.startsWith('data:')).map(line => JSON.parse(line.slice(5))).find(event => event.type === 'message_delta').usage
+          : JSON.parse(text).usage;
+        assertEq([anthropicUsage.input_tokens, anthropicUsage.output_tokens, anthropicUsage.cache_read_input_tokens],
+          [Math.max(0, expectedIncrement[1] - expectedIncrement[3]), expectedIncrement[2], expectedIncrement[3]], 'Anthropic 响应用量与落库真实用量一致');
+      }
+      await pool.cooldown(acctId, 0);
+    }
+  }
+}
+
+// 上游报错或截断不能记作成功，也不能发送 DONE。
+for (const event of [{ type: 'error', error: { message: '<400> upstream rejected', statusCode: 400 } }, { type: 'text-delta', text: 'Partial' }, stepOnly]) {
+  const before = (await pool.getRaw(acctId)).requests;
+  mockResponses = [new Response(JSON.stringify(event))];
+  const response = await handleRequest(new Request('http://localhost:3000/v1/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'Hi' }], stream: true }),
+  }));
+  const text = await response.text();
+  assert(text.includes('"error"'), '上游 SSE 错误或截断向客户端返回错误');
+  assert(!text.includes('[DONE]'), '上游 SSE 错误或截断不发送成功 DONE');
+  assertEq((await pool.getRaw(acctId)).requests, before, '失败流不增加成功计数');
+  await pool.cooldown(acctId, 0);
+}
+
+// 仅 finish-step 的非流式截断必须换号重试，不能增加成功计数。
+{
+  const before = (await pool.getRaw(acctId)).requests;
+  mockResponses = [new Response(JSON.stringify(stepOnly))];
+  const response = await handleRequest(new Request('http://localhost:3000/v1/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'Hi' }], stream: false }),
+  }));
+  assertEq(response.status, 429, '无可切换账号时截断请求不伪报成功');
+  assertEq((await pool.getRaw(acctId)).requests, before, '非流式步骤截断不计成功');
+  await pool.cooldown(acctId, 0);
 }
 
 // 测试 9.4: 故障转移与 429 冷却 (当前账号报 429 自动冷却并换号)

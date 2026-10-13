@@ -296,13 +296,17 @@
           </div>
           <div style="display:flex;gap:10px;align-items:flex-start;">
             <label style="min-width:60px;font-size:13px;color:var(--text-dim);margin-top:8px;">Prompt:</label>
-            <textarea id="test-prompt" rows="3" placeholder="输入测试问题，例如：你好，请用一句话介绍你自己">你好，请告诉我当前运行的模型和用一句话介绍你自己。</textarea>
+            <textarea id="test-prompt" rows="3" placeholder="输入测试问题，例如：你好，请用一句话介绍你自己">你好，请用一句话介绍你自己。</textarea>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:10px;">
             <button class="btn primary" id="test-send-btn" type="button">发 送 调 用</button>
           </div>
           <div style="margin-top:6px;font-size:12px;color:var(--text-dim);">响应输出:</div>
-          <div id="test-result" class="test-output">点击“发送调用”开始测试号池。</div>
+          <div id="test-result" class="test-output" role="status" aria-live="polite">点击“发送调用”开始测试号池。</div>
+          <details id="test-thinking" class="hidden">
+            <summary>思考过程（点击展开）</summary>
+            <div id="test-reasoning" class="test-output"></div>
+          </details>
         </div>
       </div>
     </section>
@@ -385,7 +389,7 @@
       'Content-Type': 'application/json',
       'X-Admin-Token': adminToken,
     }, opts.headers || {});
-    var resp = await fetch(path, Object.assign({}, opts, { headers: headers }));
+    var resp = await fetch(path, Object.assign({ cache: 'no-store' }, opts, { headers: headers }));
     if (resp.status === 401) {
       adminToken = '';
       sessionStorage.removeItem(TOKEN_KEY);
@@ -555,7 +559,7 @@
     var rows = dailyData.daily || [];
     var t = dailyData.totals || {};
     var hit = Number(t.promptTokens || 0) > 0 ? Math.round(Number(t.cacheReadTokens || 0) / Number(t.promptTokens) * 100) : null;
-    var tz = Number(dailyData.tzOffset || 8);
+    var tz = Number(dailyData.tzOffset ?? 8);
     var cards = [
       { label: '合计请求', value: fmt(t.requests), sub: '近 ' + dailyRange },
       { label: '输入 Tokens', value: fmtT(t.promptTokens), sub: '含缓存读 ' + fmtT(t.cacheReadTokens) },
@@ -565,7 +569,7 @@
     $('usage-summary').innerHTML = cards.map(function (c) {
       return '<div class="card"><div class="label">' + c.label + '</div><div class="value">' + c.value + '</div><div class="sub">' + c.sub + '</div></div>';
     }).join('');
-    $('usage-meta').textContent = '时区 UTC+' + tz + ' · 统计点数 ' + rows.length;
+    $('usage-meta').textContent = '时区 UTC' + (tz >= 0 ? '+' : '') + tz + ' · 统计点数 ' + rows.length;
     renderChart(rows);
     renderDailyTable(rows);
   }
@@ -632,7 +636,7 @@
     try {
       await api('/api/refresh', { method: 'POST', body: '{}' });
       appError('');
-      await loadQuota();
+      await Promise.all([loadQuota(), loadDaily()]);
     } catch (e) {
       if (e.message !== '未授权，请登录') appError(e.message);
     } finally {
@@ -758,7 +762,11 @@
 
     if (!prompt) return;
     btn.disabled = true; btn.textContent = '请求中…';
-    outEl.textContent = '正在连接号池发送请求…\n';
+    var modelInfo = '[请求模型] ' + model + '\n\n';
+    outEl.textContent = modelInfo + '正在连接号池发送请求…\n';
+    $('test-reasoning').textContent = '';
+    $('test-thinking').classList.add('hidden');
+    $('test-thinking').open = false;
 
     var startTime = Date.now();
     try {
@@ -778,45 +786,66 @@
         return;
       }
 
+      var usage = null;
       if (isStream) {
-        outEl.textContent = '';
+        outEl.textContent = modelInfo;
         var reader = resp.body.getReader();
         var decoder = new TextDecoder();
         var buffer = '';
-        while (true) {
-          var res = await reader.read();
-          if (res.done) break;
-          buffer += decoder.decode(res.value, { stream: true });
-          var lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (var i = 0; i < lines.length; i++) {
-            var line = lines[i].trim();
-            if (line.startsWith('data:')) {
-              var payload = line.slice(5).trim();
-              if (payload === '[DONE]') continue;
-              try {
-                var chunk = JSON.parse(payload);
-                var delta = chunk.choices?.[0]?.delta;
-                if (delta?.content) outEl.textContent += delta.content;
-                if (delta?.reasoning_content) outEl.textContent += '\n[思考] ' + delta.reasoning_content + '\n';
-              } catch (e) {}
-            }
+        var sawDone = false;
+        var sawFinish = false;
+        var readLine = function (line) {
+          line = line.trim();
+          if (!line.startsWith('data:')) return;
+          var payload = line.slice(5).trim();
+          if (payload === '[DONE]') { sawDone = true; return; }
+          var chunk;
+          try { chunk = JSON.parse(payload); } catch (e) { return; }
+          if (chunk.error) throw new Error(chunk.error.message || '上游调用失败');
+          var choice = chunk.choices?.[0];
+          if (choice?.delta?.content) outEl.textContent += choice.delta.content;
+          if (choice?.delta?.reasoning_content) {
+            $('test-thinking').classList.remove('hidden');
+            $('test-reasoning').textContent += choice.delta.reasoning_content;
           }
+          if (choice?.finish_reason) sawFinish = true;
+          if (chunk.usage) usage = chunk.usage;
+        };
+        try {
+          while (true) {
+            var res = await reader.read();
+            if (res.done) break;
+            buffer += decoder.decode(res.value, { stream: true });
+            var lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            lines.forEach(readLine);
+          }
+          buffer += decoder.decode();
+          if (buffer.trim()) readLine(buffer);
+        } catch (e) {
+          await reader.cancel().catch(function () {});
+          throw e;
+        } finally {
+          reader.releaseLock();
         }
-        outEl.textContent += '\n\n✓ 完成 (耗时: ' + (Date.now() - startTime) + 'ms)';
+        if (!sawDone || !sawFinish) throw new Error('响应提前中断，未收到完整结束帧');
       } else {
         var data = await resp.json();
         var choice = data.choices?.[0]?.message;
-        outEl.textContent = (choice?.reasoning_content ? '[思考]\n' + choice.reasoning_content + '\n\n' : '')
-          + (choice?.content || '')
-          + '\n\n[Tokens] Prompt: ' + (data.usage?.prompt_tokens || 0)
-          + ' · Completion: ' + (data.usage?.completion_tokens || 0)
-          + ' · 耗时: ' + (Date.now() - startTime) + 'ms';
+        outEl.textContent = modelInfo + (choice?.content || '');
+        if (choice?.reasoning_content) {
+          $('test-thinking').classList.remove('hidden');
+          $('test-reasoning').textContent = choice.reasoning_content;
+        }
+        usage = data.usage;
       }
-      // 刷新用量
-      if (curTab === 'quota') loadQuota();
+      outEl.textContent += '\n\n[Tokens] Prompt: ' + (usage?.prompt_tokens ?? '未提供')
+        + ' · Completion: ' + (usage?.completion_tokens ?? '未提供')
+        + ' · Cache: ' + (usage?.prompt_tokens_details?.cached_tokens ?? '未提供')
+        + '\n✓ 完成 (耗时: ' + (Date.now() - startTime) + 'ms)';
+      await Promise.all([loadQuota(), loadDaily()]);
     } catch (err) {
-      outEl.textContent = '❌ 发生错误: ' + err.message;
+      outEl.textContent += '\n\n❌ 发生错误: ' + err.message;
     } finally {
       btn.disabled = false; btn.textContent = '发 送 调 用';
     }

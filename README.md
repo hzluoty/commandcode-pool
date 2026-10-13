@@ -121,6 +121,12 @@ The dashboard at `/admin` and the API at `/api/usage/daily` track both upstream 
    - Interactive breakdown charts across `5m`, `1h`, `5h`, `1d`, `3d`, and `7d`. Removed `30d` queries fall back to `1d`.
    - Redis usage buckets expire after the maximum query window plus one day (currently 8 days). Existing buckets keep their original TTL; account keys and lifetime totals are not deleted.
    - Reads use bounded pipelines of 256 buckets. Writes atomically merge JSON counters and metadata without changing the stored format.
+   - Only fully completed gateway requests count as successes. A `finish-step` alone is not a completed request; upstream errors, truncated streams, and entirely empty responses are not counted. Real text, reasoning, or tool output is accepted even without usage. Tokens come only from upstream reports: missing fields count as 0, chunk counts are not estimates, and zero output tokens do not erase reported input/cache tokens. Streaming usage is saved before successful terminal frames are sent.
+   - Refresh All and completed Playground calls reload both accounts and usage without caching. The Playground separates the answer from collapsible reasoning and displays the requested model, tokens, and elapsed time (the requested model does not independently verify upstream model identity).
+
+### Troubleshooting usage on Vercel
+
+Check `storage` in `/health`: a persistent deployment should report `RedisPool` or `UpstashKvPool`. `FilePool` uses instance-local `/tmp`, which is neither shared across instances nor guaranteed after a cold start. Configure `REDIS_URL` or a complete REST URL/token pair and redeploy. Gateway statistics only include completed calls through this project, not historical calls made with the official CLI or other clients; upstream history is available in account details.
 
 ---
 
