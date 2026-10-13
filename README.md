@@ -60,6 +60,7 @@ Referencing and integrating key architectural paradigms from:
 Visit `/admin` in your browser. Enter your `ADMIN_TOKEN` to access the dashboard.
 - **Add Account**: Enter a Command Code API key (`user_...` or `token_user_...`) with an optional label. The pool automatically verifies the key upstream, records device fingerprints, identifies the plan, and caches initial quota data.
 - **Browser Login**: Click **浏览器登录** (Browser Login) to open the official Command Code Studio OAuth authentication page (`commandcode.ai/studio/auth/cli`). Once authenticated, copy the generated key into the dashboard.
+- **Playground**: The dashboard sends `X-Admin-Token` to `POST /api/test`, reusing pool inference, streaming, and usage accounting without exposing `API_KEYS`. If `API_KEYS` is configured but `ADMIN_TOKEN` is not, this route returns 403 until an admin password is set. With neither configured, local tests remain password-free. Public `/v1/*` inference endpoints still require client `API_KEYS` and do not accept admin credentials.
 
 ### 2. Supported Plans
 

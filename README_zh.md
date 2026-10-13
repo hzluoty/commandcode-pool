@@ -60,6 +60,7 @@
 在浏览器访问 `/admin`，输入 `ADMIN_TOKEN` 登录：
 - **手动添加账号**：输入 Command Code API Key（以 `user_` 开头），号池自动向上游请求 `/alpha/whoami` 验证、生成唯一硬件指纹、识别套餐（Go、GOAT、Pro 等），并拉取额度快照。
 - **浏览器登录**：点击「浏览器登录」按钮打开官方授权页（`commandcode.ai/studio/auth/cli`），完成登录后复制页面显示的 API Key 粘贴回控制台即可。
+- **在线测试**：控制台通过 `POST /api/test` 携带 `X-Admin-Token` 调用同一号池，支持流式与非流式并记录用量，不需要向浏览器提供 `API_KEYS`。若只配置了 `API_KEYS` 而未配置 `ADMIN_TOKEN`，此入口返回 403，需先设置管理密码；两者都未配置时可免密测试。对外 `/v1/*` 推理接口仍只接受 `API_KEYS`，不接受管理员令牌。
 
 ### 2. 支持套餐一览
 

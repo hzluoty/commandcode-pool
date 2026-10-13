@@ -121,8 +121,8 @@ async function provisionAccount(pool, config, key, label = '') {
 }
 
 // ── 核心推理处理：带统一号池调度、故障转移、流式与非流式 ──
-async function handleInference(request, config, pool, kind) {
-  if (!verifyClientAuth(request, config)) {
+async function handleInference(request, config, pool, kind, authorize = verifyClientAuth) {
+  if (!authorize(request, config)) {
     return json({ error: { message: 'Unauthorized: Invalid API Key', type: 'authentication_error' } }, 401);
   }
 
@@ -448,6 +448,14 @@ export async function handleRequest(request) {
   if (pathName.startsWith('/api/')) {
     if (!verifyAdminAuth(request, config)) {
       return json({ error: '未授权: 请提供有效的 X-Admin-Token' }, 401);
+    }
+
+    if (pathName === '/api/test' && request.method === 'POST') {
+      // 免密管理不能绕过已配置的客户端 API_KEYS。
+      if (!config.adminToken && config.apiKeys.length > 0) {
+        return json({ error: '请配置 ADMIN_TOKEN 后使用管理在线测试；客户端调用仍需 API_KEYS' }, 403);
+      }
+      return handleInference(request, config, pool, 'chat', verifyAdminAuth);
     }
 
     if (pathName === '/api/accounts' && request.method === 'GET') {

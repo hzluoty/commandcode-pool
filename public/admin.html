@@ -762,9 +762,9 @@
 
     var startTime = Date.now();
     try {
-      var resp = await fetch('/v1/chat/completions', {
+      var resp = await fetch('/api/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Token': adminToken },
         body: JSON.stringify({
           model: model,
           messages: [{ role: 'user', content: prompt }],

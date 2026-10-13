@@ -2,6 +2,7 @@
 // Command Code Pool 全套单元测试与集成测试
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import {
   KNOWN_PLANS,
   planInfo,
@@ -123,6 +124,11 @@ assertEq(fp1.components.machineId, fp2.components.machineId, '同一 API Key mac
 const sess1 = sessionForKey(testKey);
 const sess2 = sessionForKey(testKey);
 assertEq(sess1, sess2, '同一 API Key 派生出稳定的 sessionId UUID');
+const wireUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+assertEq(sess1, '56c5399a-88c0-4a7b-8189-e545fbbd5f5e', '会话哈希仅修正 UUID version/variant 位');
+assert(Array.from({ length: 32 }, (_, i) => sessionForKey(`user_uuid_${i}`)).every(id => wireUuidPattern.test(id)), '所有派生会话均为合法 UUID v4');
+assertEq(sessionForKey(testKey, { fingerprintSalt: 'salt' }), sessionForKey(testKey, { fingerprintSalt: 'salt' }), '带盐的会话身份保持确定性');
+assert(sessionForKey(testKey, { fingerprintSalt: 'salt' }) !== sess1, '不同盐派生不同会话');
 
 // 4. API 请求适配器与 9 键信封构建
 const sampleOpenAiReq = {
@@ -137,6 +143,7 @@ const sampleOpenAiReq = {
 
 const ccEnvelope = buildCcRequest(sampleOpenAiReq, { emptySystemPlaceholder: true });
 assertEq(ccEnvelope.mode, 'agent', '信封 mode 为 agent');
+assertEq(ccEnvelope.config.environment, 'win32', 'environment 为与设备指纹平台一致的字符串');
 assertEq(ccEnvelope.params.model, 'deepseek/deepseek-v4-flash', '模型透传一致');
 assertEq(ccEnvelope.params.reasoning_effort, 'high', '推理强度 high 透传一致');
 assertEq(ccEnvelope.params.system[0].text, 'You are helpful.', '系统提示词正确打包');
@@ -392,9 +399,13 @@ console.log('--- 测试 Mock 上游推理调用与故障转移 ---');
 
 const origFetch = globalThis.fetch;
 let mockResponses = [];
+const wireRequests = [];
 
 globalThis.fetch = async (url, options) => {
   const urlStr = String(url);
+  if (urlStr.includes('/alpha/')) {
+    wireRequests.push({ url: urlStr, headers: options.headers, body: JSON.parse(options.body) });
+  }
   if (urlStr.includes('/alpha/fingerprint/record') || urlStr.includes('/alpha/lifecycle-events')) {
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   }
@@ -471,6 +482,103 @@ const anthropicCallJson = await anthropicCallRes.json();
 assertEq(anthropicCallJson.type, 'message', '返回合法 Anthropic message 格式');
 assertEq(anthropicCallJson.content[0].text, 'Hello, CommandCode Go!', 'Anthropic 文本内容转换正确');
 
+// 管理在线测试与客户端鉴权必须保持独立，不能向浏览器泄露 API_KEYS。
+{
+  const savedEnv = { API_KEYS: process.env.API_KEYS, ADMIN_TOKEN: process.env.ADMIN_TOKEN };
+  const adminToken = 'test-admin-password';
+  const clientKey = 'sk-test-client';
+  process.env.API_KEYS = `${clientKey},sk-test-client-2`;
+  process.env.ADMIN_TOKEN = adminToken;
+  const testBody = { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'Hi' }], stream: false };
+  const call = (endpoint, headers = {}, body = testBody) => handleRequest(new Request(`http://localhost:3000${endpoint}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body),
+  }));
+  try {
+    for (const endpoint of ['/v1/chat/completions', '/v1/messages', '/v1/responses']) {
+      for (const headers of [{}, { 'X-Admin-Token': adminToken }, { Authorization: `Bearer ${adminToken}` }]) {
+        const before = wireRequests.length;
+        assertEq((await call(endpoint, headers)).status, 401, `${endpoint} 不允许匿名或管理员凭据替代 API_KEYS`);
+        assertEq(wireRequests.length, before, '未授权客户端不调用上游');
+      }
+    }
+    for (const headers of [{}, { 'X-Admin-Token': 'wrong' }, { Authorization: `Bearer ${clientKey}` }]) {
+      const before = wireRequests.length;
+      assertEq((await call('/api/test', headers)).status, 401, '管理测试必须通过 X-Admin-Token 鉴权');
+      assertEq(wireRequests.length, before, '未授权管理测试不调用上游');
+    }
+    for (const [endpoint, headers, body] of [
+      ['/v1/chat/completions', { Authorization: `Bearer ${clientKey}` }, testBody],
+      ['/v1/messages', { 'x-api-key': 'sk-test-client-2' }, { ...testBody, max_tokens: 1024 }],
+      ['/v1/responses', { Authorization: `Bearer ${clientKey}` }, { model: testBody.model, input: 'Hi' }],
+    ]) {
+      const response = await call(endpoint, headers, body);
+      assertEq(response.status, 200, `${endpoint} 保留 API_KEYS 客户端调用`);
+      assert((await response.text()).includes('Hello, CommandCode Go!'), '受保护协议入口正常返回模型内容');
+    }
+    for (const stream of [false, true]) {
+      const requestsBefore = (await pool.getRaw(acctId)).requests;
+      const response = await call('/api/test', { 'X-Admin-Token': adminToken }, { ...testBody, stream });
+      assertEq(response.status, 200, `管理在线测试支持 ${stream ? '流式' : '非流式'}`);
+      const text = await response.text();
+      assert(text.includes('Hello, CommandCode Go!'), '管理测试复用推理响应');
+      assert(!stream || text.includes('[DONE]'), '管理测试流式正确结束');
+      assert(!text.includes(clientKey), '管理测试不泄露客户端密钥');
+      assertEq((await pool.getRaw(acctId)).requests, requestsBefore + 1, '管理测试通过共享号池记录用量');
+    }
+
+    // 执行实际管理页脚本并触发按钮，检查请求路径、凭据和输出，而非仅匹配 HTML 文本。
+    const elements = new Map();
+    const document = { getElementById(id) {
+      if (!elements.has(id)) elements.set(id, {
+        value: '', checked: false, style: {}, textContent: '',
+        classList: { add() {}, remove() {}, toggle() {} },
+        listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; },
+      });
+      return elements.get(id);
+    } };
+    document.getElementById('test-model').value = testBody.model;
+    document.getElementById('test-prompt').value = 'Hi';
+    const browserRequests = [];
+    const context = vm.createContext({
+      document, TextDecoder,
+      localStorage: { getItem: () => adminToken }, sessionStorage: { getItem: () => null },
+      fetch: (endpoint, options) => {
+        browserRequests.push({ endpoint, options });
+        return handleRequest(new Request(`http://localhost:3000${endpoint}`, options));
+      },
+    });
+    const adminHtml = fs.readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8');
+    vm.runInContext(adminHtml.match(/<script>([\s\S]*?)<\/script>/)[1], context);
+    const sendButton = document.getElementById('test-send-btn');
+    for (const stream of [false, true]) {
+      document.getElementById('test-stream').checked = stream;
+      await sendButton.listeners.click.call(sendButton);
+      const sent = browserRequests.filter(r => JSON.parse(r.options.body || '{}').messages).at(-1);
+      assertEq(sent.endpoint, '/api/test', '管理页按钮走管理测试入口');
+      assertEq(sent.options.headers['X-Admin-Token'], adminToken, '管理页按钮发送现有管理员凭据');
+      assert(!JSON.stringify(sent).includes(clientKey), '管理页不获取或发送 API_KEYS');
+      assert(document.getElementById('test-result').textContent.includes('Hello, CommandCode Go!'), '实际管理页显示模型响应');
+      assertEq(sendButton.disabled, false, '管理测试结束后按钮恢复');
+    }
+
+    delete process.env.ADMIN_TOKEN;
+    const before = wireRequests.length;
+    const noAdminResponse = await call('/api/test');
+    assertEq(noAdminResponse.status, 403, '未配置 ADMIN_TOKEN 时管理测试不能绕过 API_KEYS');
+    assert((await noAdminResponse.text()).includes('ADMIN_TOKEN'), '缺少管理员配置时给出明确提示');
+    assertEq(wireRequests.length, before, '未配置管理密码不得调用受保护上游');
+    delete process.env.API_KEYS;
+    const openTestResponse = await call('/api/test');
+    assertEq(openTestResponse.status, 200, '无鉴权配置时保留本地免密管理测试');
+    await openTestResponse.text();
+  } finally {
+    for (const [name, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
 // 测试 9.4: 故障转移与 429 冷却 (当前账号报 429 自动冷却并换号)
 const acc2Id = await pool.add('user_failover_2', 'acct-2');
 
@@ -499,6 +607,15 @@ const failoverRes = await handleRequest(failoverReq);
 assertEq(failoverRes.status, 200, '429 触发故障转移后下游客户端仍返回 200 成功');
 const failoverJson = await failoverRes.json();
 assertEq(failoverJson.choices[0].message.content, 'Failover succeeded!', '故障转移自动切换到正常账号响应');
+
+const generateRequests = wireRequests.filter(r => r.url.includes('/alpha/generate'));
+assert(generateRequests.length > 0, '已捕获各协议发送的真实上游信封');
+assert(generateRequests.every(r => typeof r.body.config.environment === 'string'), '所有协议上游 environment 均为字符串');
+assert(generateRequests.every(r => wireUuidPattern.test(r.body.threadId)), '所有协议上游 threadId 均通过严格 UUID 校验');
+assert(wireRequests.every(r => r.headers['x-session-id'] === sessionForKey(r.headers.Authorization.slice(7), config)), '所有上游头复用同一确定性会话身份');
+assert(generateRequests.every(r => r.body.threadId === r.headers['x-session-id']), 'threadId 与 x-session-id 一致');
+assert(wireRequests.filter(r => r.url.includes('/alpha/lifecycle-events')).every(r =>
+  r.body.events[0].sessionId === r.headers['x-session-id'] && wireUuidPattern.test(r.body.events[0].sessionId)), '生命周期注册 sessionId 与上游 UUID 一致');
 
 globalThis.fetch = origFetch;
 
