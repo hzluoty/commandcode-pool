@@ -18,7 +18,16 @@ try {
   await Promise.all(clients.map(client => client.connect()));
   assert.equal(await clients[0].dbSize(), 0, 'Test database must be empty');
   const [pool, otherPool] = clients.map(client => new RedisPool(url.href, 8, client));
+  await clients[0].hSet('cc_pool:accounts', '99', JSON.stringify({ id: 99, api_key: 'user_local_redis_legacy_key_1', label: 'legacy' }));
+  await assert.rejects(pool.add('user_local_redis_legacy_key_1', 'legacy duplicate'), error => error.status === 409, 'First add must migrate existing accounts before duplicate checking');
+  assert.equal(await clients[0].sIsMember('cc_pool:api_keys', 'user_local_redis_legacy_key_1'), true, 'Legacy key is added to the API-key index');
   const id = await pool.add('user_local_redis_test_key_1', 'existing account');
+  const duplicateAdds = await Promise.allSettled([
+    pool.add('user_local_redis_duplicate_key_1', 'duplicate-a'),
+    otherPool.add('user_local_redis_duplicate_key_1', 'duplicate-b'),
+  ]);
+  assert.equal(duplicateAdds.filter(result => result.status === 'fulfilled').length, 1, 'Concurrent adds of one API key must create one account');
+  assert.equal(duplicateAdds.filter(result => result.status === 'rejected' && result.reason.status === 409).length, 1, 'Concurrent duplicate add must return HTTP 409');
   const raw = await pool.getRaw(id);
   Object.assign(raw, { requests: 5, prompt_tokens: 10, plan_id: 'individual-go' });
   await clients[0].hSet('cc_pool:accounts', String(id), JSON.stringify(raw));

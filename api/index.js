@@ -13,6 +13,8 @@ import {
   MODEL_CACHE_TTL_MS,
   BUILTIN_MODELS,
   STUDIO_BASE_URL,
+  DEFAULT_STREAM_IDLE_MS,
+  MAX_SSE_EVENT_CHARS,
 } from '../lib/constants.js';
 import { getConfig } from '../lib/config.js';
 import {
@@ -34,6 +36,7 @@ import {
   createAnthropicSseTranslator,
   createResponsesSseTranslator,
   collectCcStream,
+  readWithIdle,
   collectedUsageOpenAI,
   buildAnthropicResponse,
   mapCcError,
@@ -97,7 +100,7 @@ function verifyClientAuth(req, config) {
 
 // 管理员鉴权（ADMIN_TOKEN 保护 /api 接口）
 function verifyAdminAuth(req, config) {
-  if (!config.adminToken) return true;
+  if (!config.adminToken) return !config.apiKeys.length;
   const adminHeader = req.headers.get('x-admin-token') || '';
   return safeEqual(adminHeader, config.adminToken);
 }
@@ -124,8 +127,12 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
 
   let clientBody;
   try {
-    clientBody = await request.json();
-  } catch (e) {
+    clientBody = await readBody(request);
+  } catch (error) {
+    const tooLarge = error.status === 413;
+    return json({ error: { message: tooLarge ? error.message : 'Invalid JSON request body', type: 'invalid_request_error' } }, error.status || 400);
+  }
+  if (!clientBody || typeof clientBody !== 'object' || Array.isArray(clientBody)) {
     return json({ error: { message: 'Invalid JSON request body', type: 'invalid_request_error' } }, 400);
   }
 
@@ -137,6 +144,13 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
     openaiReq = convertResponsesToChat(clientBody);
   } else {
     openaiReq = clientBody;
+  }
+
+  let ccBody;
+  try {
+    ccBody = buildCcRequest(openaiReq, config);
+  } catch (error) {
+    return json({ error: { message: error.message || 'Invalid request body', type: 'invalid_request_error' } }, 400);
   }
 
   const model = openaiReq.model || DEFAULT_MODEL;
@@ -156,7 +170,6 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
 
     let upstreamResp;
     try {
-      const ccBody = buildCcRequest(openaiReq, config);
       upstreamResp = await forwardToCC(ccBody, account.api_key, config, request.signal, openaiReq.prompt_cache_key, request.headers);
     } catch (err) {
       if (err.name === 'AbortError') throw err;
@@ -220,9 +233,19 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
 
           try {
             while (true) {
-              const { done, value } = await upstreamReader.read();
+              let chunk;
+              try { chunk = await readWithIdle(upstreamReader, DEFAULT_STREAM_IDLE_MS); }
+              catch (error) {
+                if (error.code !== 'STREAM_IDLE_TIMEOUT') throw error;
+                const event = translator.errorEvent({ body: { error: { message: error.message, type: 'upstream_error' } } });
+                if (event) send(event);
+                controller.close();
+                return;
+              }
+              const { done, value } = chunk;
               if (done) break;
               streamBuffer += decoder.decode(value, { stream: true });
+              if (streamBuffer.length > MAX_SSE_EVENT_CHARS) throw new Error('upstream SSE event is too large');
 
               let idx;
               while ((idx = streamBuffer.indexOf('\n')) >= 0) {
@@ -260,13 +283,18 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
             if (typeof translator.getDoneEvent === 'function') send(translator.getDoneEvent());
             controller.close();
           } catch (streamErr) {
-            controller.error(streamErr);
+            const error = { body: { error: { message: streamErr.message || 'Upstream stream failed', type: 'upstream_error' } } };
+            try {
+              const event = translator.errorEvent(error);
+              if (event) send(event);
+            } catch {}
+            controller.close();
           } finally {
             try { upstreamReader.releaseLock(); } catch {}
           }
         },
         cancel() {
-          try { upstreamReader.cancel(); } catch {}
+          upstreamReader.cancel().catch(() => {});
         },
       });
 
@@ -323,12 +351,20 @@ async function handleInference(request, config, pool, kind, authorize = verifyCl
         model,
         output_text: collected.fullText,
         output: [
-          {
-            id: `msg_${Date.now()}`,
+          ...(collected.toolCalls || []).map(call => ({
+            id: `fc_${crypto.randomUUID()}`,
+            type: 'function_call',
+            status: 'completed',
+            call_id: call.id,
+            name: call.function.name,
+            arguments: call.function.arguments,
+          })),
+          ...(collected.fullText ? [{
+            id: `msg_${crypto.randomUUID()}`,
             type: 'message',
             role: 'assistant',
             content: [{ type: 'output_text', text: collected.fullText, annotations: [] }],
-          },
+          }] : []),
         ],
         usage: {
           input_tokens: usage.prompt_tokens,
@@ -427,8 +463,10 @@ export async function handleRequest(request) {
 
   // 5. 管理端 API (/api/*)
   if (pathName === '/api/login' && request.method === 'POST') {
-    if (!config.adminToken) return json({ ok: true });
-    const body = await readBody(request) || {};
+    if (!config.adminToken) return config.apiKeys.length ? json({ error: '请配置 ADMIN_TOKEN 后启用管理 API' }, 403) : json({ ok: true });
+    let body;
+    try { body = (await readBody(request)) || {}; }
+    catch (error) { return json({ error: error.message }, error.status || 400); }
     if (safeEqual(String(body.password || ''), config.adminToken)) return json({ ok: true });
     return json({ error: '管理员密码错误' }, 401);
   }
@@ -447,14 +485,11 @@ export async function handleRequest(request) {
   // 后续 /api 路由需要管理员鉴权
   if (pathName.startsWith('/api/')) {
     if (!verifyAdminAuth(request, config)) {
-      return json({ error: '未授权: 请提供有效的 X-Admin-Token' }, 401);
+      const status = !config.adminToken && config.apiKeys.length ? 403 : 401;
+      return json({ error: status === 403 ? '请配置 ADMIN_TOKEN 后使用管理 API；客户端调用仍需 API_KEYS' : '未授权: 请提供有效的 X-Admin-Token' }, status);
     }
 
     if (pathName === '/api/test' && request.method === 'POST') {
-      // 免密管理不能绕过已配置的客户端 API_KEYS。
-      if (!config.adminToken && config.apiKeys.length > 0) {
-        return json({ error: '请配置 ADMIN_TOKEN 后使用管理在线测试；客户端调用仍需 API_KEYS' }, 403);
-      }
       return handleInference(request, config, pool, 'chat', verifyAdminAuth);
     }
 
@@ -464,7 +499,9 @@ export async function handleRequest(request) {
     }
 
     if (pathName === '/api/accounts' && request.method === 'POST') {
-      const body = (await readBody(request)) || {};
+      let body;
+      try { body = (await readBody(request)) || {}; }
+      catch (error) { return json({ error: error.message }, error.status || 400); }
       const key = sanitizeApiKey(body.key);
       const label = String(body.label || '').trim();
       if (!key) return json({ error: 'Key 不能为空' }, 400);
@@ -483,7 +520,9 @@ export async function handleRequest(request) {
     if (accountMatch) {
       const id = Number(accountMatch[1]);
       if (request.method === 'PATCH') {
-        const body = (await readBody(request)) || {};
+        let body;
+        try { body = (await readBody(request)) || {}; }
+        catch (error) { return json({ error: error.message }, error.status || 400); }
         await pool.patch(id, { label: body.label, enabled: body.enabled });
         const list = await pool.list();
         return json({ ok: true, account: list.find(a => a.id === id) });
@@ -495,7 +534,9 @@ export async function handleRequest(request) {
     }
 
     if (pathName === '/api/refresh' && request.method === 'POST') {
-      const body = (await readBody(request)) || {};
+      let body;
+      try { body = (await readBody(request)) || {}; }
+      catch (error) { return json({ error: error.message }, error.status || 400); }
       const accounts = await pool.list();
       const targets = body.id != null ? accounts.filter(a => a.id === Number(body.id)) : accounts;
       if (body.id != null && !targets.length) return json({ error: '账号不存在' }, 404);

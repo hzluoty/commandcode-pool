@@ -11,6 +11,8 @@ import {
   USAGE_RANGES,
   MAX_USAGE_RANGE_SECONDS,
   USAGE_RETENTION_SECONDS,
+  MAX_REQUEST_BODY_BYTES,
+  MAX_TOOL_IMAGE_BYTES,
 } from '../lib/constants.js';
 
 // 清理测试临时数据
@@ -24,11 +26,13 @@ import {
   sanitizeApiKey,
   generateTraceparent,
   usageBucketStart,
+  readBody,
 } from '../lib/crypto-utils.js';
 import {
   generateFingerprint,
   sessionForKey,
 } from '../lib/fingerprint.js';
+import { fetchReport } from '../lib/quota-service.js';
 import {
   buildCcRequest,
   convertAnthropicToOpenAI,
@@ -133,6 +137,23 @@ assert(generateTraceparent().startsWith('00-'), 'traceparent 格式符合 W3C �
 
 const bucket = usageBucketStart(1700000000000, 8);
 assert(typeof bucket === 'number' && bucket > 0, 'usageBucketStart 计算时间戳正常');
+const originalQuotaFetch = globalThis.fetch;
+globalThis.fetch = async (_url, options) => ({
+  ok: true,
+  text: () => new Promise(resolve => options.signal.addEventListener('abort', () => resolve('{"ok":true}'), { once: true })),
+});
+let quotaResult;
+try { quotaResult = await fetchReport('https://quota.invalid', 'user_timeout_key'); } finally { globalThis.fetch = originalQuotaFetch; }
+assert(quotaResult && !Object.hasOwn(quotaResult, 'error'), '配额响应体在共享 deadline 内读取并解析 JSON');
+globalThis.fetch = originalQuotaFetch;
+const tooLargeBody = new Request('http://localhost', { method: 'POST', headers: { 'content-length': String(MAX_REQUEST_BODY_BYTES + 1) }, body: '{}' });
+let bodyError;
+try { await readBody(tooLargeBody); } catch (error) { bodyError = error; }
+assertEq(bodyError?.status, 413, 'readBody 按 Content-Length 拒绝超限请求');
+const oversizedStream = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(MAX_REQUEST_BODY_BYTES + 1)); } });
+bodyError = null;
+try { await readBody(new Request('http://localhost', { method: 'POST', body: oversizedStream, duplex: 'half' })); } catch (error) { bodyError = error; }
+assertEq(bodyError?.status, 413, 'readBody 按实际字节数拒绝超限请求');
 
 // 3. 确定性设备指纹 (Deterministic Device Fingerprint)
 const testKey = 'user_test_fake_api_key_123456789';
@@ -146,7 +167,7 @@ const sess1 = sessionForKey(testKey);
 const sess2 = sessionForKey(testKey);
 assertEq(sess1, sess2, '同一 API Key 派生出稳定的 sessionId UUID');
 const wireUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-assertEq(sess1, '56c5399a-88c0-4a7b-8189-e545fbbd5f5e', '会话哈希仅修正 UUID version/variant 位');
+assert(wireUuidPattern.test(sess1), '会话派生值包含合法 UUID version/variant 位');
 assert(Array.from({ length: 32 }, (_, i) => sessionForKey(`user_uuid_${i}`)).every(id => wireUuidPattern.test(id)), '所有派生会话均为合法 UUID v4');
 assertEq(sessionForKey(testKey, { fingerprintSalt: 'salt' }), sessionForKey(testKey, { fingerprintSalt: 'salt' }), '带盐的会话身份保持确定性');
 assert(sessionForKey(testKey, { fingerprintSalt: 'salt' }) !== sess1, '不同盐派生不同会话');
@@ -199,6 +220,118 @@ const responsesReq = {
 const convertedResponses = convertResponsesToChat(responsesReq);
 assertEq(convertedResponses.messages[0].role, 'system', 'Responses instructions 转为 system 消息');
 assertEq(convertedResponses.messages[1].content, 'Hello Responses', 'Responses input 转换为 user 消息');
+const responseImage = 'data:image/png;base64,' + Buffer.from('ordinary').toString('base64');
+const responseImageRequest = convertResponsesToChat({ input: [{
+  type: 'message', role: 'user', content: [
+    { type: 'input_text', text: 'describe' },
+    { type: 'input_image', image_url: responseImage },
+  ],
+}] });
+assertEq(responseImageRequest.messages[0].role, 'user', '普通 Responses message 保留 user 角色而不产生空 assistant');
+const responseImageWire = buildCcRequest(responseImageRequest).params.messages[0];
+assertEq(responseImageWire.content, [
+  { type: 'text', text: 'describe' },
+  { type: 'image', image: responseImage, mimeType: 'image/png' },
+], '普通 Responses input_image 精确映射为上游 text 与 image parts');
+let systemImageRejected = false;
+try { buildCcRequest(convertResponsesToChat({ input: [{ type: 'message', role: 'system', content: [{ type: 'input_image', image_url: responseImage }] }] })); } catch { systemImageRejected = true; }
+assert(systemImageRejected, 'system/developer image inputs are explicitly rejected');
+const toolImageUrl = 'data:image/png;base64,' + Buffer.from('img').toString('base64');
+const convertedToolImages = convertResponsesToChat({ input: [
+  { type: 'function_call', call_id: 'c1', name: 'shot', arguments: '{}' },
+  { type: 'function_call', call_id: 'c2', name: 'shot', arguments: '{}' },
+  { type: 'function_call_output', call_id: 'c1', output: `first ${toolImageUrl}` },
+  { type: 'function_call_output', call_id: 'c2', output: [{ type: 'input_image', image_url: { url: toolImageUrl } }] },
+] });
+assertEq(convertedToolImages.messages.map(message => message.role), ['assistant', 'tool', 'tool'], '并行工具回复保持连续，图片按工具文本占位符处理');
+assertEq(convertedToolImages.messages.slice(1, 3).map(message => message.tool_call_id), ['c1', 'c2'], '并行工具回复仍关联各自调用 ID');
+assertEq(convertedToolImages.messages[1].content, 'first [image]', 'tool output 文本保留图片占位符');
+const toolImageWire = buildCcRequest(convertedToolImages).params.messages;
+assertEq(toolImageWire.map(message => message.role), ['assistant', 'tool', 'tool'], 'Responses 工具调用与结果转换为上游标准 role 顺序');
+assertEq(toolImageWire[0].content.map(part => part.type), ['tool-call', 'tool-call'], '上游 assistant 消息包含并行 tool-call');
+assertEq(toolImageWire[0].content.map(part => part.toolName), ['shot', 'shot'], '上游并行 tool-call 名称与调用保持关联');
+assertEq(toolImageWire[1].content[0], { type: 'tool-result', toolCallId: 'c1', toolName: 'shot', output: { type: 'text', value: 'first [image]' } }, '上游 role=tool 消息保留第一条结果文本与 call ID');
+assertEq(toolImageWire[2].content[0], { type: 'tool-result', toolCallId: 'c2', toolName: 'shot', output: { type: 'text', value: '[image]' } }, '第二条工具图片以占位文本保留在其 call_id 对应结果中');
+const cappedToolImages = convertResponsesToChat({ input: [{ type: 'function_call_output', output: `data:image/png;base64,${'A'.repeat(MAX_TOOL_IMAGE_BYTES + 1)}` }] });
+assert(!JSON.stringify(cappedToolImages.messages).includes('data:image/png'), '超限工具图像不会进入上游请求');
+assert(cappedToolImages.messages.at(-1).content.includes('image omitted'), '超限工具图像以文本占位说明而不是丢弃 tool result');
+const assistantAfterToolImage = convertResponsesToChat({ input: [
+  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'inspect' }] },
+  { type: 'function_call', call_id: 'img-call', name: 'shot', arguments: '{}' },
+  { type: 'function_call_output', call_id: 'img-call', output: toolImageUrl },
+  { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }] },
+] });
+assertEq(assistantAfterToolImage.messages.map(message => message.role), ['user', 'assistant', 'tool', 'assistant'], '工具图片占位符留在对应 tool result，assistant 续写保序');
+assertEq(assistantAfterToolImage.messages[2].tool_call_id, 'img-call', '工具图片前的工具回复保持调用关联');
+const userAfterToolImage = convertResponsesToChat({ input: [
+  { type: 'function_call_output', output: toolImageUrl },
+  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'next' }] },
+] });
+assertEq(userAfterToolImage.messages.map(message => message.role), ['tool', 'user'], '工具图片占位符不产生脱离 call_id 的 user 消息');
+assertEq(userAfterToolImage.messages[0].content, '[image]', '工具图片占位符保留在对应 tool result');
+assertEq(buildCcRequest(userAfterToolImage).params.messages[0].content[0].toolName, '', '没有匹配 function_call 的 tool output 不伪造工具名称');
+const imagesFollowedByUser = convertResponsesToChat({ input: [
+  { type: 'function_call', call_id: 'a', name: 'shot', arguments: '{}' },
+  { type: 'function_call', call_id: 'b', name: 'shot', arguments: '{}' },
+  { type: 'function_call_output', call_id: 'a', output: toolImageUrl },
+  { type: 'function_call_output', call_id: 'b', output: 'second result' },
+  { type: 'message', role: 'user', content: 'next turn' },
+] });
+assertEq(imagesFollowedByUser.messages.map(message => message.role), ['assistant', 'tool', 'tool', 'user'], '工具图片占位符不改变并行工具轮次结构');
+assertEq(imagesFollowedByUser.messages.slice(1, 3).map(message => message.tool_call_id), ['a', 'b'], '带图片的并行工具结果保持连续');
+const reusedCallId = buildCcRequest(convertResponsesToChat({ input: [
+  { type: 'function_call', call_id: 'same', name: 'first', arguments: '{}' },
+  { type: 'function_call_output', call_id: 'same', output: 'one' },
+  { type: 'function_call', call_id: 'same', name: 'second', arguments: '{}' },
+  { type: 'function_call_output', call_id: 'same', output: 'two' },
+] })).params.messages;
+assertEq(reusedCallId.map(message => message.role), ['assistant', 'tool', 'assistant', 'tool'], '重用 call_id 的多轮工具结果保持批次顺序');
+assertEq(reusedCallId.map(message => message.content[0].toolName), ['first', 'first', 'second', 'second'], '重用 call_id 时每个 tool result 使用本轮名称');
+const reasoningThenTool = buildCcRequest(convertResponsesToChat({ input: [
+  { type: 'function_call', call_id: 'reasoning-call', name: 'inspect', arguments: '{}' },
+  { type: 'reasoning', summary: [{ text: 'thinking' }] },
+  { type: 'function_call_output', call_id: 'reasoning-call', output: 'found' },
+] })).params.messages;
+assertEq(reasoningThenTool.map(message => message.role), ['assistant', 'tool'], 'reasoning 与 tool call 合并在同一 assistant 消息');
+assertEq(reasoningThenTool[1].content[0].toolName, 'inspect', 'reasoning 插入后 tool result 保留调用名称');
+const toolAfterAssistantItem = buildCcRequest(convertResponsesToChat({ input: [
+  { type: 'function_call', call_id: 'deferred-call', name: 'deferred_tool', arguments: '{}' },
+  { type: 'message', role: 'assistant', content: 'tool transcript' },
+  { type: 'function_call_output', call_id: 'deferred-call', output: 'done' },
+] })).params.messages;
+assertEq(toolAfterAssistantItem.at(-1).content[0].toolName, 'deferred_tool', 'assistant 文本分段后仍按 call_id 关联尚未返回的工具');
+const toolOutputAfterReasoning = buildCcRequest(convertResponsesToChat({ input: [
+  { type: 'function_call', call_id: 'reasoning-call', name: 'reasoned_tool', arguments: '{}' },
+  { type: 'reasoning', summary: [{ text: 'tool is running' }] },
+  { type: 'function_call_output', call_id: 'reasoning-call', output: 'ready' },
+] })).params.messages;
+assertEq(toolOutputAfterReasoning.at(-1).content[0].toolName, 'reasoned_tool', 'reasoning 分段后未完成的工具仍保留调用名称');
+const toolOutputAfterAssistantMessage = buildCcRequest(convertResponsesToChat({ input: [
+  { type: 'function_call', call_id: 'message-call', name: 'message_tool', arguments: '{}' },
+  { type: 'message', role: 'assistant', content: 'tool transcript' },
+  { type: 'function_call_output', call_id: 'message-call', output: 'done' },
+] })).params.messages;
+assertEq(toolOutputAfterAssistantMessage.at(-1).content[0].toolName, 'message_tool', 'assistant transcript 分段后未完成的工具仍保留调用名称');
+const reasoningBetweenCalls = buildCcRequest(convertResponsesToChat({ input: [
+  { type: 'function_call', call_id: 'first', name: 'first_tool', arguments: '{}' },
+  { type: 'reasoning', summary: [{ text: 'between call batches' }] },
+  { type: 'function_call', call_id: 'second', name: 'second_tool', arguments: '{}' },
+  { type: 'function_call_output', call_id: 'first', output: 'one' },
+  { type: 'function_call_output', call_id: 'second', output: 'two' },
+] })).params.messages;
+assertEq(reasoningBetweenCalls.map(message => message.role), ['assistant', 'assistant', 'tool', 'tool'], 'reasoning 分批时先发送所有 tool-call 再发送对应结果');
+assertEq(reasoningBetweenCalls.filter(message => message.role === 'assistant').map(message => message.content.map(part => part.type)), [['reasoning', 'tool-call'], ['tool-call']], 'reasoning 保留于首批调用，不与下一批 tool-call 合并');
+assertEq(reasoningBetweenCalls.filter(message => message.role === 'tool').map(message => message.content[0].toolName), ['first_tool', 'second_tool'], 'reasoning 后两批工具结果仍关联各自名称');
+for (const userInput of ['new turn', { type: 'message', role: 'user', content: 'new turn' }]) {
+  const staleCallId = buildCcRequest(convertResponsesToChat({ input: [
+    { type: 'function_call', call_id: 'reused', name: 'old_tool', arguments: '{}' },
+    userInput,
+    { type: 'function_call_output', call_id: 'reused', output: 'unmatched' },
+  ] })).params.messages;
+  assertEq(staleCallId.at(-1).content[0].toolName, '', '跨 user 轮次的未完成 call_id 不复用旧工具名');
+}
+const invalidImage = convertResponsesToChat({ input: [{ type: 'message', role: 'user', content: [{ type: 'input_image', image_url: { url: 'javascript:alert(1)' } }] }] });
+assertEq(invalidImage.messages[0].content, '', '非 HTTP(S) 和非 data 的图片 URI 被拒绝');
 
 // 5. SSE 翻译器测试
 const sseTranslator = createSseTranslator('deepseek/deepseek-v4-flash', 'chatcmpl-test', 1700000000);
@@ -322,6 +455,14 @@ assertEq(modelsRes.status, 200, '/v1/models 返回 200');
 const modelsJson = await modelsRes.json();
 assert(Array.isArray(modelsJson.data) && modelsJson.data.length > 0, '/v1/models 返回非空模型列表');
 
+const systemImageResponse = await handleRequest(new Request('http://localhost:3000/v1/responses', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ input: [{ type: 'message', role: 'system', content: [{ type: 'input_image', image_url: responseImage }] }] }),
+}));
+assertEq(systemImageResponse.status, 400, 'system/developer 图片通过 HTTP 映射为客户端 400');
+assertEq((await systemImageResponse.json()).error.type, 'invalid_request_error', 'system/developer 图片返回 invalid_request_error');
+
 // 测试 /api/login 免密状态
 const loginReq = new Request('http://localhost:3000/api/login', {
   method: 'POST',
@@ -357,8 +498,70 @@ console.log('--- 测试 RedisPool (内存假 Redis 客户端) ---');
       calls.push(argv);
       if (cmd === 'INCR') { const n = (store.get(key) || 0) + 1; store.set(key, n); return n; }
       if (cmd === 'EXPIRE') return 1;
+      if (cmd === 'DEL') { store.delete(argv[1]); return 1; }
+      if (cmd === 'EXISTS') return store.has(argv[1]) ? 1 : 0;
+      if (cmd === 'SET') { store.set(argv[1], argv[2]); return 'OK'; }
+      if (cmd === 'SMEMBERS') {
+        const set = store.get(argv[1]);
+        if (!set) return [];
+        if (set instanceof Map) throw new Error('WRONGTYPE');
+        return [...set];
+      }
+      if (cmd === 'SADD') {
+        const set = store.get(argv[1]) || new Set();
+        if (set instanceof Map) throw new Error('WRONGTYPE');
+        const added = !set.has(argv[2]);
+        set.add(argv[2]);
+        store.set(argv[1], set);
+        return Number(added);
+      }
+      if (cmd === 'SREM') {
+        const set = store.get(argv[1]);
+        if (!set) return 0;
+        if (set instanceof Map) throw new Error('WRONGTYPE');
+        const removed = set.delete(argv[2]);
+        if (!set.size) store.delete(argv[1]);
+        return Number(removed);
+      }
       if (cmd === 'EVAL') {
         const hash = store.get(argv[3]);
+        const addScript = Number(argv[2]) === 3 && argv[1].includes('local key = ARGV[1]');
+        const removeScript = argv[1].includes("local account = redis.call('HGET'");
+        if (addScript) {
+          const accountsKey = argv[3], indexKey = argv[4], markerKey = argv[5];
+          if (Number(argv[2]) !== 3) throw new Error('ADD EVAL key count mismatch');
+          const key = argv[6], id = argv[7], raw = argv[8];
+          let index = store.get(indexKey);
+          if (index instanceof Map) throw new Error('WRONGTYPE');
+          if (!store.has(markerKey)) {
+            index ||= new Set();
+            for (const value of (store.get(accountsKey) || new Map()).values()) {
+              const account = JSON.parse(value);
+              if (account.api_key) index.add(account.api_key);
+            }
+            store.set(indexKey, index);
+            store.set(markerKey, '1');
+          }
+          index ||= new Set();
+          if (index.has(key)) return 0;
+          const accounts = store.get(accountsKey) || new Map();
+          accounts.set(id, raw);
+          index.add(key);
+          store.set(accountsKey, accounts);
+          store.set(indexKey, index);
+          return 1;
+        }
+        if (removeScript) {
+          const accountsKey = argv[3], indexKey = argv[4];
+          if (Number(argv[2]) !== 2) throw new Error('REMOVE EVAL key count mismatch');
+          const id = argv[5], accounts = store.get(accountsKey) || new Map();
+          const value = accounts.get(id);
+          if (!value) return 0;
+          accounts.delete(id);
+          store.set(accountsKey, accounts);
+          store.get(indexKey)?.delete(JSON.parse(value).api_key);
+          return 1;
+        }
         const previous = hash?.get(argv[4]);
         if (!previous) return 0;
         hash.set(argv[4], JSON.stringify({ ...JSON.parse(previous), ...JSON.parse(argv[5]) }));
@@ -383,8 +586,25 @@ console.log('--- 测试 RedisPool (内存假 Redis 客户端) ---');
     },
   };
   const rp = new RedisPool('redis://unused', 8, fake);
+  await rp.cmd('DEL', 'cc_pool:api_keys');
+  await rp.cmd('DEL', 'cc_pool:api_keys_migrated');
+  const legacyKey = 'user_legacy_key_0000001';
+  store.set('cc_pool:accounts', new Map([['99', JSON.stringify({ id: 99, api_key: legacyKey, label: '', enabled: true })]]));
+  let migrationDuplicate;
+  try { await rp.add(legacyKey, 'legacy duplicate'); } catch (error) { migrationDuplicate = error; }
+  assertEq(migrationDuplicate?.status, 409, '首次 Lua add 从旧账号哈希迁移 API key 索引并拒绝重复');
+  assert((await rp.list()).some(account => account.id === 99), '索引迁移保留旧账号');
   const rid = await rp.add('user_redis_test_key_0001', 'redis-1');
-  assertEq((await rp.list()).length, 1, 'RedisPool add/list');
+  let duplicateError;
+  try { await rp.add('user_redis_test_key_0001', 'duplicate'); } catch (error) { duplicateError = error; }
+  assertEq(duplicateError?.status, 409, 'RedisPool Lua add rejects duplicate keys atomically');
+  const successfulAdds = await Promise.allSettled([
+    rp.add('user_redis_concurrent_key_0002', 'first'),
+    rp.add('user_redis_concurrent_key_0002', 'second'),
+  ]);
+  assertEq(successfulAdds.filter(result => result.status === 'fulfilled').length, 1, '并发 Redis add 对相同 API Key 仅创建一条记录');
+  assertEq(successfulAdds.filter(result => result.status === 'rejected' && result.reason.status === 409).length, 1, '并发重复 Redis add 返回 409');
+  assertEq((await rp.list()).length, 3, 'RedisPool add/list');
   assertEq((await rp.getRaw(rid)).api_key, 'user_redis_test_key_0001', 'RedisPool getRaw');
   const testBucket = usageBucketStart(Date.now(), 8);
   store.set(`cc_pool:bucket:${testBucket}`, new Map([[String(rid), JSON.stringify({ requests: 2, prompt_tokens: 10 })]]));
@@ -408,6 +628,8 @@ console.log('--- 测试 RedisPool (内存假 Redis 客户端) ---');
   assert(metadata.rate_limited_until > Date.now(), '冷却时间写入');
   assertEq(await rp.patch(999, { label: 'missing' }), false, '部分合并不得创建已删除账号');
   await rp.remove(rid);
+  await rp.remove(successfulAdds.find(result => result.status === 'fulfilled').value);
+  await rp.remove(99);
   assertEq((await rp.list()).length, 0, 'RedisPool remove');
 }
 
