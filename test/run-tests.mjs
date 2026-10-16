@@ -580,7 +580,7 @@ assertEq(anthropicCallJson.content[0].text, 'Hello, CommandCode Go!', 'Anthropic
       },
     });
     const adminHtml = fs.readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8');
-    vm.runInContext(adminHtml.match(/<script>([\s\S]*?)<\/script>/)[1], context);
+    vm.runInContext(adminHtml.match(/<\s*script\b[^>]*>([\s\S]*?)<\s*\/\s*script\b[^>]*>/i)[1], context);
     const sendButton = document.getElementById('test-send-btn');
     for (const stream of [false, true]) {
       document.getElementById('test-stream').checked = stream;
