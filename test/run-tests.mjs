@@ -61,13 +61,32 @@ let passed = 0;
 let failed = 0;
 const errors = [];
 
+function redactForLog(value) {
+  if (value == null) return value;
+  if (typeof value === 'string') return sanitizeApiKey(value);
+  if (Array.isArray(value)) return value.map(redactForLog);
+  if (typeof value === 'object') {
+    const sensitiveKeys = new Set(['api_key', 'apikey', 'apiKey', 'authorization', 'token', 'secret', 'password']);
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (sensitiveKeys.has(k)) {
+        out[k] = typeof v === 'string' ? sanitizeApiKey(v) : '[REDACTED]';
+      } else {
+        out[k] = redactForLog(v);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
 function assert(condition, testName, extra) {
   if (condition) {
     passed++;
   } else {
     failed++;
     errors.push({ testName, extra });
-    console.error(`❌ FAIL: ${testName}`, extra ? extra : '');
+    console.error(`❌ FAIL: ${testName}`, extra ? redactForLog(extra) : '');
   }
 }
 
