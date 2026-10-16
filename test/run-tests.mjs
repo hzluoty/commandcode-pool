@@ -243,32 +243,34 @@ const convertedToolImages = convertResponsesToChat({ input: [
   { type: 'function_call_output', call_id: 'c1', output: `first ${toolImageUrl}` },
   { type: 'function_call_output', call_id: 'c2', output: [{ type: 'input_image', image_url: { url: toolImageUrl } }] },
 ] });
-assertEq(convertedToolImages.messages.map(message => message.role), ['assistant', 'tool', 'tool'], '并行工具回复保持连续，图片按工具文本占位符处理');
+assertEq(convertedToolImages.messages.map(message => message.role), ['assistant', 'tool', 'tool', 'user'], '并行工具回复连续，图片统一置于本批次结果之后');
 assertEq(convertedToolImages.messages.slice(1, 3).map(message => message.tool_call_id), ['c1', 'c2'], '并行工具回复仍关联各自调用 ID');
-assertEq(convertedToolImages.messages[1].content, 'first [image]', 'tool output 文本保留图片占位符');
+assertEq(convertedToolImages.messages[1].content, 'first [image]', '内联工具图片以占位符留在工具文本中');
+assertEq(convertedToolImages.messages[3].content, [{ type: 'image_url', image_url: { url: toolImageUrl } }, { type: 'image_url', image_url: { url: toolImageUrl } }], '并行工具图片聚合并保留输出顺序');
 const toolImageWire = buildCcRequest(convertedToolImages).params.messages;
-assertEq(toolImageWire.map(message => message.role), ['assistant', 'tool', 'tool'], 'Responses 工具调用与结果转换为上游标准 role 顺序');
+assertEq(toolImageWire.map(message => message.role), ['assistant', 'tool', 'tool', 'user'], 'Responses 工具结果图片按上游 CLI 消息策略转换');
 assertEq(toolImageWire[0].content.map(part => part.type), ['tool-call', 'tool-call'], '上游 assistant 消息包含并行 tool-call');
 assertEq(toolImageWire[0].content.map(part => part.toolName), ['shot', 'shot'], '上游并行 tool-call 名称与调用保持关联');
 assertEq(toolImageWire[1].content[0], { type: 'tool-result', toolCallId: 'c1', toolName: 'shot', output: { type: 'text', value: 'first [image]' } }, '上游 role=tool 消息保留第一条结果文本与 call ID');
-assertEq(toolImageWire[2].content[0], { type: 'tool-result', toolCallId: 'c2', toolName: 'shot', output: { type: 'text', value: '[image]' } }, '第二条工具图片以占位文本保留在其 call_id 对应结果中');
-const cappedToolImages = convertResponsesToChat({ input: [{ type: 'function_call_output', output: `data:image/png;base64,${'A'.repeat(MAX_TOOL_IMAGE_BYTES + 1)}` }] });
-assert(!JSON.stringify(cappedToolImages.messages).includes('data:image/png'), '超限工具图像不会进入上游请求');
-assert(cappedToolImages.messages.at(-1).content.includes('image omitted'), '超限工具图像以文本占位说明而不是丢弃 tool result');
+assertEq(toolImageWire[2].content[0], { type: 'tool-result', toolCallId: 'c2', toolName: 'shot', output: { type: 'text', value: '[image]' } }, '工具图片结果的 tool-result 保留占位并关联 call_id');
+assertEq(toolImageWire[3].content, [{ type: 'image', image: toolImageUrl, mimeType: 'image/png' }, { type: 'image', image: toolImageUrl, mimeType: 'image/png' }], '并行工具图片 payload 经上游 user image parts 发送');
+const cappedToolImages = convertResponsesToChat({ input: [{ type: 'function_call_output', output: `data:image/png;base64,${'A'.repeat(Math.ceil(MAX_TOOL_IMAGE_BYTES * 4 / 3) + 8)}` }] });
+assert(!JSON.stringify(cappedToolImages.messages).includes('data:image/png'), '超限工具图片不进入上游请求');
+assert(cappedToolImages.messages.some(message => message.role === 'tool' && message.content.includes('image omitted')), '超限工具图片以占位文本留在 tool result');
 const assistantAfterToolImage = convertResponsesToChat({ input: [
   { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'inspect' }] },
   { type: 'function_call', call_id: 'img-call', name: 'shot', arguments: '{}' },
   { type: 'function_call_output', call_id: 'img-call', output: toolImageUrl },
   { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }] },
 ] });
-assertEq(assistantAfterToolImage.messages.map(message => message.role), ['user', 'assistant', 'tool', 'assistant'], '工具图片占位符留在对应 tool result，assistant 续写保序');
+assertEq(assistantAfterToolImage.messages.map(message => message.role), ['user', 'assistant', 'tool', 'user', 'assistant'], '工具图片作为 user 图片消息置于工具结果和续写之间');
 assertEq(assistantAfterToolImage.messages[2].tool_call_id, 'img-call', '工具图片前的工具回复保持调用关联');
 const userAfterToolImage = convertResponsesToChat({ input: [
   { type: 'function_call_output', output: toolImageUrl },
   { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'next' }] },
 ] });
-assertEq(userAfterToolImage.messages.map(message => message.role), ['tool', 'user'], '工具图片占位符不产生脱离 call_id 的 user 消息');
-assertEq(userAfterToolImage.messages[0].content, '[image]', '工具图片占位符保留在对应 tool result');
+assertEq(userAfterToolImage.messages.map(message => message.role), ['tool', 'user', 'user'], '工具图片在下一条输入之前作为 user 图片消息发送');
+assertEq(userAfterToolImage.messages[1].content[0].image_url.url, toolImageUrl, '工具图片 payload 保留');
 assertEq(buildCcRequest(userAfterToolImage).params.messages[0].content[0].toolName, '', '没有匹配 function_call 的 tool output 不伪造工具名称');
 const imagesFollowedByUser = convertResponsesToChat({ input: [
   { type: 'function_call', call_id: 'a', name: 'shot', arguments: '{}' },
@@ -277,7 +279,7 @@ const imagesFollowedByUser = convertResponsesToChat({ input: [
   { type: 'function_call_output', call_id: 'b', output: 'second result' },
   { type: 'message', role: 'user', content: 'next turn' },
 ] });
-assertEq(imagesFollowedByUser.messages.map(message => message.role), ['assistant', 'tool', 'tool', 'user'], '工具图片占位符不改变并行工具轮次结构');
+assertEq(imagesFollowedByUser.messages.map(message => message.role), ['assistant', 'tool', 'tool', 'user', 'user'], '并行工具结果后才发送累积图片与下一轮输入');
 assertEq(imagesFollowedByUser.messages.slice(1, 3).map(message => message.tool_call_id), ['a', 'b'], '带图片的并行工具结果保持连续');
 const reusedCallId = buildCcRequest(convertResponsesToChat({ input: [
   { type: 'function_call', call_id: 'same', name: 'first', arguments: '{}' },
